@@ -1,0 +1,16 @@
+# ZCode 工作产物
+.zcode/plans/
+
+# 测试产物
+_worktrees/
+.worktrees/
+_probe*/
+_smoke*/
+
+# 编辑器
+.vscode/
+.idea/
+
+# 临时
+*.tmp
+*.bak

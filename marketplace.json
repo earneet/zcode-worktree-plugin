@@ -1,0 +1,6 @@
+{
+  "name": "zcode-worktree-plugin",
+  "plugins": [
+    { "name": "zcode-worktree-guard", "source": "./plugins/zcode-worktree-guard" }
+  ]
+}
