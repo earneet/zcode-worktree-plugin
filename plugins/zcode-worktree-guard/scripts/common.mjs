@@ -5,6 +5,11 @@ import { execFileSync } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+import module from "node:module";
+
+// ESM 没有 require，用 createRequire 创建一个（用于加载 node:sqlite 同步 API）。
+// 直接 require("node:sqlite") 在 .mjs 模块内会抛 ReferenceError，导致 DB 继承静默失效。
+const esmRequire = module.createRequire(import.meta.url);
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -421,7 +426,8 @@ export function queryParentId(sessionId) {
   // 返回 parent_id 字符串，或 null（顶层会话/查询失败）。任何异常返回 null（降级）。
   let DatabaseSync;
   try {
-    ({ DatabaseSync } = require("node:sqlite"));
+    // 用 esmRequire（createRequire）而非裸 require——ESM 模块内裸 require 不可用。
+    ({ DatabaseSync } = esmRequire("node:sqlite"));
   } catch {
     return null; // node:sqlite 不可用（Node < 22.5）
   }
