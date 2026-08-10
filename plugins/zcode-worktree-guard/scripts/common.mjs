@@ -185,10 +185,8 @@ function stateFile(common) { return path.join(stateDirOf(common), "state.json");
 function basesFile(common) { return path.join(stateDirOf(common), "bases.json"); }
 function metaFile(common) { return path.join(stateDirOf(common), "meta.json"); }
 function bindingsDir(common) { return path.join(stateDirOf(common), "bindings"); }
-function allowlistDir(common) { return path.join(stateDirOf(common), "allowlist"); }
 function auditFile(common) { return path.join(stateDirOf(common), "audit.jsonl"); }
 function bindingFile(common, sessionId) { return path.join(bindingsDir(common), `${sessionId}.json`); }
-function allowlistFile(common, sessionId) { return path.join(allowlistDir(common), `${sessionId}.json`); }
 
 function readJson(f) {
   if (!fs.existsSync(f)) return null;
@@ -271,45 +269,45 @@ export function findBindingsForWorktree(common, worktreePath) {
 }
 
 // ---------------------------------------------------------------------------
-// v0.2 会话级临时放行：allowlist/<session_id>.json
+// v0.2 临时放行：allowlist.json（仓库级单文件，不按 session 分）
+// 理由：wt.mjs（agent 通过 Bash 调用）和 hook（ZCode spawn）的 session_id 来源不一致，
+// 按 session 分文件会导致 wt.mjs 写的和 hook 读的 key 对不上。逃生口语义属于"这个仓库
+// 临时放行某些路径"，不需要 session 隔离。allowlist 记调用者 session_id 仅作审计。
 
-export function loadAllowlist(common, sessionId) {
-  return readJson(allowlistFile(common, sessionId)) || { paths: [] };
+function allowlistFileRepo(common) { return path.join(stateDirOf(common), "allowlist.json"); }
+
+export function loadAllowlist(common) {
+  return readJson(allowlistFileRepo(common)) || { paths: [] };
 }
 
-export function saveAllowlist(common, sessionId, data) {
-  writeJson(allowlistFile(common, sessionId), data);
+export function saveAllowlist(common, data) {
+  writeJson(allowlistFileRepo(common), data);
 }
 
-export function clearAllowlist(common, sessionId) {
-  const f = allowlistFile(common, sessionId);
+export function clearAllowlist(common) {
+  const f = allowlistFileRepo(common);
   if (fs.existsSync(f)) fs.unlinkSync(f);
 }
 
-export function addAllowlistEntry(common, sessionId, entry) {
-  // entry: {path, reason, created_at, expires_at?}
-  const al = loadAllowlist(common, sessionId);
+export function addAllowlistEntry(common, entry) {
+  const al = loadAllowlist(common);
   if (!al.paths) al.paths = [];
   al.paths.push(entry);
-  saveAllowlist(common, sessionId, al);
+  saveAllowlist(common, al);
 }
 
-export function isAllowlisted(common, sessionId, targetPath, root) {
-  // 检查 targetPath 是否在当前 session 的放行列表里（含 TTL 过期检查）
-  const al = loadAllowlist(common, sessionId);
+export function isAllowlisted(common, targetPath, root) {
+  const al = loadAllowlist(common);
   if (!al.paths || al.paths.length === 0) return false;
   const now = Date.now();
   const nTarget = norm(targetPath);
   const nRoot = norm(root);
   for (const entry of al.paths) {
-    // TTL 检查
     if (entry.expires_at && new Date(entry.expires_at).getTime() < now) continue;
-    // 匹配：entry.path 是相对 root 的 glob，或绝对路径
     const ep = entry.path;
     if (path.isAbsolute(ep)) {
       if (matchGlob(nTarget, norm(ep))) return true;
     } else {
-      // 相对 root 的 glob。path.join 后必须再 norm（小写化 + 分隔符归一），否则大小写不匹配
       const absPattern = norm(path.join(nRoot, ep));
       if (matchGlob(nTarget, absPattern)) return true;
     }

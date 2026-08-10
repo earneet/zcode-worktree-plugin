@@ -221,7 +221,8 @@ async function cmdRevoke(params, cwd) {
 }
 
 // ---------------------------------------------------------------------------
-// v0.2 allow 子命令（会话级临时放行，替代 MCP worktree_allow）
+// v0.2 allow 子命令（仓库级临时放行，替代 MCP worktree_allow）
+// 仓库级单文件（不按 session 分）：wt.mjs 和 hook 的 session_id 来源不同，按 session 分会错配
 async function cmdAllow(params, cwd) {
   const { common, root } = C.findGitContextForCwd(cwd);
   if (!common) return fail("当前目录不在 git 仓库内。");
@@ -229,19 +230,20 @@ async function cmdAllow(params, cwd) {
   const action = params.action || "add";
 
   if (action === "list") {
-    const al = C.loadAllowlist(common, sessionId);
-    if (!al.paths || al.paths.length === 0) return ok(`会话 ${sessionId} 当前无放行路径。`);
-    const lines = [`会话 ${sessionId} 放行路径:`];
+    const al = C.loadAllowlist(common);
+    if (!al.paths || al.paths.length === 0) return ok(`当前仓库无放行路径。`);
+    const lines = [`放行路径:`];
     for (const e of al.paths) {
       const exp = e.expires_at ? ` (至 ${e.expires_at})` : "";
-      lines.push(`  ${e.path}${exp} — ${e.reason || "无说明"}`);
+      const by = e.by_session ? ` [by ${e.by_session}]` : "";
+      lines.push(`  ${e.path}${exp}${by} — ${e.reason || "无说明"}`);
     }
     return ok(lines.join("\n"));
   }
 
   if (action === "clear") {
-    C.clearAllowlist(common, sessionId);
-    return ok(`✅ 已清空会话 ${sessionId} 的放行列表。`);
+    C.clearAllowlist(common);
+    return ok(`✅ 已清空放行列表。`);
   }
 
   // add
@@ -261,11 +263,11 @@ async function cmdAllow(params, cwd) {
 
   const ttlMin = parseInt(params.ttl_minutes || "60", 10);
   const expiresAt = new Date(Date.now() + ttlMin * 60000).toISOString();
-  C.addAllowlistEntry(common, sessionId, {
-    path: targetPath, reason, created_at: C.nowIso(), expires_at: expiresAt,
+  C.addAllowlistEntry(common, {
+    path: targetPath, reason, by_session: sessionId, created_at: C.nowIso(), expires_at: expiresAt,
   });
   C.appendAudit(common, { type: "allow_add", sessionId, path: targetPath, reason, expires_at: expiresAt });
-  ok(`✅ 已为会话 ${sessionId} 放行: ${targetPath}\n原因: ${reason || "无"}\n有效期至: ${expiresAt}\n审计已记录。`);
+  ok(`✅ 已放行: ${targetPath}\n原因: ${reason || "无"}\n有效期至: ${expiresAt}（by ${sessionId}）\n审计已记录。`);
 }
 
 // ---------------------------------------------------------------------------

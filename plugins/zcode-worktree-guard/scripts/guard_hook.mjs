@@ -77,9 +77,9 @@ function decideWrite(target, ctx, isWrite) {
     return { action: "allow", source: "whitelist" };
   }
 
-  // 4. session 级临时放行（worktree_allow）
-  if (C.isAllowlisted(ctx.common, ctx.sessionId, target, ctx.root)) {
-    return { action: "allow", source: "session-allowlist" };
+  // 4. 临时放行（wt.mjs allow，仓库级单文件）
+  if (C.isAllowlisted(ctx.common, target, ctx.root)) {
+    return { action: "allow", source: "allowlist" };
   }
 
   // 5. 全局 authorize-main
