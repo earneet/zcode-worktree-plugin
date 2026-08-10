@@ -24,18 +24,33 @@
 
 ## 安装
 
-### 方式 A：从本地目录安装（推荐，开发/自用）
+### 方式 A：从 GitHub 安装（推荐，分享/自用）
 
-Settings → Plugin Management → **Discover** → 右上角 **`+`** → 选择本仓库根目录
-（`F:\workspace_2\zcode-worktree-plugin`）→ 安装后在 Discover 找到 `zcode-worktree-guard`
-点 **Get**。重启 ZCode 生效。
+Settings → Plugin Management → **Discover** → 右上角 **`+`** → 输入：
 
-### 方式 B：plugins.dirs 本地加载（纯开发调试）
+```
+earneet/zcode-worktree-plugin
+```
+
+添加 marketplace 后，在 Discover 找到 `zcode-worktree-guard` 点 **Get**。重启 ZCode 生效。
+
+或指定分支 / tag / commit：
+
+```
+earneet/zcode-worktree-plugin/tree/<ref>
+```
+
+### 方式 B：从本地目录安装（开发/自用）
+
+Settings → Plugin Management → **Discover** → **`+`** → 选择本仓库根目录
+（含 `marketplace.json` 的那一层）→ 在 Discover 找到 `zcode-worktree-guard` 点 **Get**。重启 ZCode 生效。
+
+### 方式 C：plugins.dirs 本地加载（纯开发调试）
 
 在 `~/.zcode/cli/config.json` 加：
 
 ```json
-{ "plugins": { "dirs": ["F:\\workspace_2\\zcode-worktree-plugin\\plugins\\zcode-worktree-guard"] } }
+{ "plugins": { "dirs": ["<本仓库>/plugins/zcode-worktree-guard"] } }
 ```
 
 重启 ZCode 即加载（inline，默认启用）。
