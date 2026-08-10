@@ -78,7 +78,22 @@ echo '{"reason": "用户授权合并 worktree-add-drop-module"}' | node "<WT>" a
 
 # 撤销授权（授权操作完成后立即执行）
 echo '{}' | node "<WT>" revoke-main
+
+# v0.2 会话级临时放行（写主目录某文件，不经过 worktree）
+echo '{"action": "add", "path": "README.md", "reason": "临时改文档"}' | node "<WT>" allow
+echo '{"action": "list"}' | node "<WT>" allow     # 查看当前会话放行列表
+echo '{"action": "clear"}' | node "<WT>" allow    # 清空放行
 ```
+
+## 何时用 allow（逃生口）
+
+正常情况下，所有代码改动都应进 worktree（透明重写会自动处理）。**仅当**你需要写
+仓库级配置/文档（如 AGENTS.md、CI 配置）到主 checkout 时，才用逃生口：
+
+- **白名单（永久、声明式）**：在 `<repo>/.zcode/worktree-guard.json` 配置
+  `"main_write_whitelist": ["AGENTS.md", "docs/**/*.md"]`。这些路径永远写主目录。
+- **allow 子命令（临时、本次会话）**：上面示例，放行 60 分钟（可配 `ttl_minutes`）。
+  拒绝放行 `.git`、仓库根、`*` 等危险路径（注入防护）。每次调用记审计日志。
 
 ## 开发任务标准流程
 

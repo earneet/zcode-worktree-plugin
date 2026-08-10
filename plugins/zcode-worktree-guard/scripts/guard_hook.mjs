@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// zcode-worktree-guard PreToolUse hook：透明路径重写 + 拦截防御（TypeScript 同源版）。
-// 双层架构：重写层把主 checkout 路径透明改写到 worktree；拦截层 deny 危险操作。
-// 设计原则：fail-open。ZCode 字段名：Write/Edit/Read=file_path；Glob/Grep=path；Bash=command。
+// zcode-worktree-guard PreToolUse hook v0.2
+// 透明路径重写 + 拦截防御，基于决策表 + resolveBinding 三层降级。
+// fail-open（进程级异常放行）+ fail-closed（绑定解析失败则 block 写）。
 import * as C from "./common.mjs";
 import path from "node:path";
 import fs from "node:fs";
@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WT_TOOL = path.join(__dirname, "wt.mjs");
 
-// git 全局选项（-C/-c）可出现于子命令之前
+// git 危险操作正则
 const GIT_PREFIX = String.raw`\bgit\s+(?:(?:-C|-c)\s+\S+\s+)*`;
 const GIT_MUTATE_RE = new RegExp(GIT_PREFIX + String.raw`(merge|rebase|pull)\b`, "i");
 const GIT_MERGE_TARGET_RE = new RegExp(
@@ -34,140 +34,160 @@ function emitRewrite(updatedInput) {
 
 function block(reason, ctx) {
   const target = ctx.target || ctx.command || "(无)";
-  const active = ctx.active_wt || "无";
   process.stderr.write(
     "\n🔴🔴🔴 worktree-guard 拦截 🔴🔴🔴\n\n" +
-    "当前上下文（操作前请务必确认）：\n" +
+    "当前上下文:\n" +
     `  当前分支: ${ctx.branch}\n` +
     `  当前位置: ${ctx.cwd}\n` +
     `  主 checkout 根: ${ctx.root}\n` +
-    `  活动 worktree: ${active}\n` +
+    `  活动 worktree: ${ctx.binding ? ctx.binding.worktree : "无"}\n` +
     `  目标/命令: ${target}\n\n` +
     `拦截原因: ${reason}\n\n` +
-    "修正方式（按推荐顺序）：\n" +
-    "1. 若这是普通开发任务 → 先 create 创建副本，再 enter 进入（之后写主 checkout 路径会自动重写到副本）；\n" +
-    "2. 若用户明确授权在主 checkout 上修改或合并 →\n" +
-    `   运行: echo '{"reason":"用户授权 XXX"}' | node "${WT_TOOL}" authorize-main\n` +
-    `   完成后运行: echo '{}' | node "${WT_TOOL}" revoke-main\n` +
-    `（工具用法详见 worktree-workflow 技能；脚本: node "${WT_TOOL}" <create|enter|exit|status>，stdin 传 JSON）\n`
+    "修正方式:\n" +
+    "1. 普通开发任务 → 先 create + enter（之后写主 checkout 路径会自动重写到副本）；\n" +
+    "2. 需临时写主目录某文件 → echo '{\"action\":\"add\",\"path\":\"<相对路径>\",\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" allow；\n" +
+    "3. 用户明确授权全局 → echo '{\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" authorize-main；\n" +
+    `（脚本: node "${WT_TOOL}" <create|enter|exit|allow|authorize-main>，stdin 传 JSON）\n`
   );
   process.exit(2);
 }
 
 // ---------------------------------------------------------------------------
-// Write/Edit/Read 的 file_path 处理
+// v0.2 决策表：Write/Edit/Read 的 file_path 判定（纯函数）
+// 返回 {action: "allow"|"deny"|"rewrite", reason, newTarget?, source?}
+
+function decideWrite(target, ctx, isWrite) {
+  const nTarget = C.norm(target);
+  const nRoot = C.norm(ctx.root);
+  const binding = ctx.binding; // resolveBinding 结果，可能 null
+
+  // 1. .git 保护（硬规则）
+  const nGit = C.norm(path.join(ctx.root, ".git"));
+  if (C.isInside(nTarget, nGit)) {
+    return { action: "deny", reason: "目标路径在 .git 下，禁止操作（保护 git 元数据）。" };
+  }
+
+  // 2. 仓库外放行
+  if (!C.isInside(nTarget, nRoot)) {
+    return { action: "allow", source: "outside-repo" };
+  }
+
+  // 3. 白名单（声明式，sidecar 配置）
+  if (C.matchWhitelist(target, ctx.root, ctx.whitelist)) {
+    return { action: "allow", source: "whitelist" };
+  }
+
+  // 4. session 级临时放行（worktree_allow）
+  if (C.isAllowlisted(ctx.common, ctx.sessionId, target, ctx.root)) {
+    return { action: "allow", source: "session-allowlist" };
+  }
+
+  // 5. 全局 authorize-main
+  if (ctx.globalAllow) {
+    return { action: "allow", source: "global-authorize" };
+  }
+
+  // 6-8. 有绑定的情况
+  if (binding && binding.worktree) {
+    const nWt = C.norm(binding.worktree);
+    if (C.isInside(nTarget, nWt)) {
+      return { action: "allow", source: "inside-worktree" }; // 6. 写副本内
+    }
+    if (C.isInside(nTarget, nRoot)) {
+      // 7. 主 checkout 根下 → 透明重写
+      const rel = path.relative(nRoot, nTarget);
+      return { action: "rewrite", newTarget: path.join(binding.worktree, rel), source: "rewrite" };
+    }
+    // 8. 其他位置（其他副本等）
+    return { action: "deny", reason: "目标在其他副本内，不允许跨副本写入。" };
+  }
+
+  // 9. 无绑定（含 DB 失败降级到底）：Write/Edit fail-closed deny；Read allow
+  if (isWrite) {
+    return { action: "deny", reason: "当前会话无 worktree 绑定，写主 checkout 被禁止。先 create+enter，或用 allow/authorize-main 放行。" };
+  }
+  return { action: "allow", source: "read-no-binding" };
+}
+
+// ---------------------------------------------------------------------------
 function handleFilePathTool(toolInput, context, isWrite) {
   const target = toolInput.file_path || "";
   if (!target) return;
 
-  const cwd = context.cwd;
-  const root = context.root;
-  const activeWt = context._active_wt;
-
-  const targetAbs = path.isAbsolute(target) ? target : path.join(cwd, target);
-  const nTarget = C.norm(targetAbs);
-  const nRoot = C.norm(root);
-
-  // 仓库外路径放行
-  if (!C.isInside(nTarget, nRoot)) return;
+  const targetAbs = path.isAbsolute(target) ? target : path.join(context.cwd, target);
   context.target = targetAbs;
 
-  // .git 保护
-  const nGit = C.norm(path.join(root, ".git"));
-  if (C.isInside(nTarget, nGit)) {
-    block("目标路径在 .git 下，禁止操作（保护 git 元数据）。", context);
+  const decision = decideWrite(targetAbs, context, isWrite);
+  if (decision.action === "allow") return;
+  if (decision.action === "rewrite") {
+    emitRewrite({ ...toolInput, file_path: decision.newTarget });
   }
-
-  // 授权放行
-  if (context._allow_main) return;
-
-  if (activeWt) {
-    const nWt = C.norm(activeWt.path);
-    if (C.isInside(nTarget, nWt)) return; // 已在副本内放行
-    // 主 checkout 根下 → 透明重写 R→W
-    const rel = path.relative(nRoot, nTarget);
-    const newAbs = path.join(activeWt.path, rel);
-    const newInput = { ...toolInput, file_path: newAbs };
-    emitRewrite(newInput);
-  }
-
-  // 无活动 worktree：Write/Edit 拦截（写保护）；Read 放行
-  if (isWrite) {
-    block("当前无活动 worktree，且未授权。按工作流约定，一般修改禁止在主 checkout 进行。", context);
-  }
+  // deny
+  block(decision.reason, context);
 }
 
 // ---------------------------------------------------------------------------
-// Glob/Grep 的 path 处理
 function handleSearchPathTool(toolInput, context) {
-  const activeWt = context._active_wt;
-  if (!activeWt) return;
+  const binding = context.binding;
+  if (!binding) return; // 无绑定放行（搜索只读）
 
-  const cwd = context.cwd;
-  const root = context.root;
   const p = toolInput.path;
-
   if (!p) {
-    // path 缺省 → 注入 path = worktree
-    emitRewrite({ ...toolInput, path: activeWt.path });
+    // path 缺省 → 注入 worktree
+    emitRewrite({ ...toolInput, path: binding.worktree });
   }
 
-  const pAbs = path.isAbsolute(p) ? p : path.join(cwd, p);
+  const pAbs = path.isAbsolute(p) ? p : path.join(context.cwd, p);
   const nP = C.norm(pAbs);
-  const nRoot = C.norm(root);
-  const nWt = C.norm(activeWt.path);
+  const nRoot = C.norm(context.root);
+  const nWt = C.norm(binding.worktree);
 
-  if (C.isInside(nP, nWt)) return; // 已在副本内
-  if (!C.isInside(nP, nRoot)) return; // 仓库外
-  // 主 checkout 根下 → 重写 R→W
+  if (C.isInside(nP, nWt)) return;
+  if (!C.isInside(nP, nRoot)) return;
   const rel = path.relative(nRoot, nP);
-  const newAbs = path.join(activeWt.path, rel);
-  emitRewrite({ ...toolInput, path: newAbs });
+  emitRewrite({ ...toolInput, path: path.join(binding.worktree, rel) });
 }
 
 // ---------------------------------------------------------------------------
-// Bash：不重写，只拦危险 git 操作
 function handleBash(toolInput, context) {
   const command = toolInput.command || "";
   if (!command) return;
   context.command = command;
 
-  if (context._allow_main) return;
+  // 全局授权放行
+  if (context.globalAllow) return;
 
   const branch = context.branch;
   const branchL = branch.toLowerCase();
-  const protected_ = context._protected;
-  const hasActive = context._active_wt != null;
+  const protected_ = context.protected_;
+  const hasBinding = context.binding != null;
 
   // 1. git push 到 master/main
   if (GIT_PUSH_PROTECTED_RE.test(command) || (GIT_PUSH_DEFAULT_RE.test(command) && protected_.has(branchL))) {
     block("git push 到受保护分支（master/main），必须用户明确授权。", context);
   }
 
-  // 2. 有活动 worktree 时禁止切到受保护分支
-  if (hasActive || context.in_worktree) {
+  // 2. 有绑定时禁止切到受保护分支
+  if (hasBinding || context.in_worktree) {
     const m = GIT_CHECKOUT_RE.exec(command);
     if (m && protected_.has(m[2].toLowerCase())) {
-      block(
-        `当前有活动 worktree，禁止执行 git checkout/switch ${m[2]}。副本应始终工作在 worktree-<task> 分支；如需切换任务，先 exit 再 enter。`,
-        context
-      );
+      block(`当前有 worktree 绑定，禁止 git checkout/switch ${m[2]}。`, context);
     }
   }
 
   // 3. 删 worktree 分支
   if (GIT_DEL_WORKTREE_RE.test(command)) {
-    block("删除 worktree 分支必须用户明确授权。通常通过 exit(action='remove') 删除副本目录，分支保留。", context);
+    block("删除 worktree 分支必须用户明确授权。", context);
   }
 
-  // 4. git merge / rebase / pull
+  // 4. merge/rebase/pull 检查
   if (GIT_MUTATE_RE.test(command)) {
     if (protected_.has(branchL)) {
-      block(`当前在受保护分支 ${branch}，git merge / rebase / pull 会改变其历史或内容。把 worktree 分支合并进来必须获得用户明确授权。`, context);
+      block(`当前在受保护分支 ${branch}，merge/rebase/pull 需用户明确授权。`, context);
     }
     const m = GIT_MERGE_TARGET_RE.exec(command);
     if (m) {
-      block(`检测到尝试把 ${m[2]} 合并到当前分支 ${branch}。worktree 分支只能合并到主分支，且必须用户明确授权。`, context);
+      block(`检测到合并 ${m[2]} 到 ${branch}。worktree 分支只能合并到主分支，且须用户授权。`, context);
     }
   }
 }
@@ -184,6 +204,7 @@ async function main() {
   let ctx = {};
   try { ctx = raw.trim() ? JSON.parse(raw.replace(/^\ufeff/, "")) : {}; } catch { ctx = {}; }
   const cwd = ctx.cwd || process.cwd();
+  const sessionId = ctx.session_id || process.env.ZCODE_SESSION_ID || "cli-manual";
   const toolName = ctx.tool_name || "";
   const toolInput = ctx.tool_input || {};
 
@@ -204,18 +225,18 @@ async function main() {
   }
   if (!common) return; // 非 git → 放行
 
-  const activeWt = C.loadStateByCommon(common);
-  const override = C.loadOverrideByCommon(common);
-  const allowMain = !!(override && override.allow_main_writes);
-
+  // v0.2：三层降级解析绑定
+  const binding = C.resolveBinding(common, sessionId);
   const cfg = C.loadConfig(root);
+  const globalAllow = C.loadGlobalAllow(common);
+  const whitelist = C.whitelistPatterns(cfg);
   const protected_ = C.protectedBranches(cfg);
-  if (activeWt && activeWt.base) protected_.add(activeWt.base.toLowerCase());
+  if (binding && binding.base) protected_.add(binding.base.toLowerCase());
 
   const context = {
     cwd, root, branch, in_worktree: inWt,
-    active_wt: activeWt ? activeWt.path : null,
-    _active_wt: activeWt, _allow_main: allowMain, _protected: protected_,
+    binding, sessionId, common,
+    whitelist, globalAllow, protected_,
   };
 
   if (toolName === "Write" || toolName === "Edit") {
@@ -230,4 +251,3 @@ async function main() {
 }
 
 main().catch(() => process.exit(0));
-process.on("exit", (code) => { if (code === undefined) process.exit(0); });
