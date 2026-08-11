@@ -44,12 +44,13 @@
 |---|---|
 | 🔄 **透明路径重写** | 主 checkout 路径自动改写到活动 worktree，agent 无感知 |
 | 🔴 **主分支写保护** | 无活动 worktree 时，写主 checkout 一律拦截 |
-| 🛡️ **危险操作拦截** | merge/rebase/push 到 master/main、副本内 checkout master、删 worktree 分支 |
+| 🛡️ **危险操作拦截** | merge/rebase/push 到 master/main、副本内 checkout master、删 worktree 分支、跨副本写入 |
 | 🧠 **自动纪律注入** | SessionStart hook 让每个会话默认知道 worktree 工作流 |
-| 📦 **完整生命周期** | create / enter / exit / status / authorize-main / revoke-main |
+| 📦 **完整生命周期** | create / enter / exit / status / authorize-main / revoke-main / allow |
 | 🔍 **Bash cd 解析** | 从命令串提取 `cd` 目标，跨会话目录也能定位真实工作位置 |
-| 🗂️ **仓库级绑定** | 状态存 git common dir，重启自动恢复，子代理自动继承 |
-| 🪶 **零依赖** | 纯 Node.js 标准库，与 ZCode 同栈 |
+| 🔗 **会话级绑定 + 继承** | 每 session 独立绑定，子代理经 DB parent 链自动继承父 worktree |
+| 🚪 **双层逃生口** | 声明式白名单（`main_write_whitelist`）+ 临时 allow 放行（带 TTL + 审计） |
+| 🪶 **零依赖** | 纯 Node.js 标准库（ESM `.mjs`），与 ZCode 同栈 |
 
 ## 安装
 
@@ -114,17 +115,19 @@ echo '{}' | node <plugin>/scripts/wt.mjs revoke-main
 
 | 场景 | 结果 |
 |---|---|
-| 有活动 worktree，写主 checkout 路径 | ✅ **自动重写**到 worktree |
-| 有活动 worktree，写副本内路径 | ✅ 放行 |
-| 有活动 worktree，Glob/Grep 无 path | ✅ 自动注入 path=worktree |
-| 无活动 worktree，Write/Edit 主 checkout | 🔴 拦截（写保护） |
-| 无活动 worktree，Read 主 checkout | ✅ 放行（只读不拦） |
-| 写 `.git` 路径 | 🔴 拦截（保护 git 元数据） |
+| 有绑定，写主 checkout 路径 | ✅ **自动重写**到 worktree |
+| 有绑定，写副本内路径 | ✅ 放行 |
+| 有绑定，写**其他** worktree 副本 | 🔴 拦截（跨副本保护） |
+| 有绑定，Glob/Grep 无 path | ✅ 自动注入 path=worktree |
+| 路径命中白名单或 allowlist | ✅ 放行（写主目录，不重写） |
+| 无绑定，Write/Edit 主 checkout | 🔴 拦截（fail-closed 写保护） |
+| 无绑定，Read 主 checkout | ✅ 放行（只读不拦） |
+| 写 `.git` 路径 | 🔴 拦截（硬规则，优先于一切） |
 | master/main 上 `git merge/rebase/pull` | 🔴 拦截（需授权） |
 | `git push` 到 master/main | 🔴 拦截（需授权） |
 | 副本内 `git checkout master/main` | 🔴 拦截 |
 | 删除 worktree 分支 | 🔴 拦截 |
-| `authorize-main` 授权期间 | ✅ 全部放行 |
+| `authorize-main` 授权期间 | ✅ 全部放行（`.git` 仍拦） |
 | 仓库外路径、非 git 目录 | ✅ 放行 |
 
 ## 可选配置
@@ -135,26 +138,59 @@ echo '{}' | node <plugin>/scripts/wt.mjs revoke-main
 {
   "branch_prefix": "worktree-",
   "worktree_parent": ".worktrees",
-  "protected_branches": ["master", "main"]
+  "protected_branches": ["master", "main"],
+  "main_write_whitelist": ["AGENTS.md", "docs/**/*.md"]
 }
 ```
+
+| 字段 | 说明 |
+|---|---|
+| `branch_prefix` | worktree 分支名前缀（默认 `worktree-`） |
+| `worktree_parent` | worktree 副本父目录（默认 `.worktrees`） |
+| `protected_branches` | 额外受保护分支（默认含 `master`、`main`） |
+| `main_write_whitelist` | 声明式白名单：这些路径写主目录不重写不拦截（glob 支持 `*`/`**`/`?`）。危险裸根模式（`*`、`/`、`.` 等）会被自动过滤 |
+
+### 临时放行（allow 逃生口）
+
+正常开发都应走 worktree（透明重写）。仅当需临时写仓库级配置/文档到主 checkout 时：
+
+```bash
+# 放行单个路径 60 分钟（可配 ttl_minutes），记审计日志
+echo '{"action":"add","path":"README.md","reason":"临时改文档"}' | node <plugin>/scripts/wt.mjs allow
+echo '{"action":"list"}' | node <plugin>/scripts/wt.mjs allow    # 查看
+echo '{"action":"clear"}' | node <plugin>/scripts/wt.mjs allow   # 清空
+```
+
+`.git`、根目录、`*` 等危险路径会被拒绝（注入防护）。
 
 ## 状态文件位置
 
 ```
 <git-common-dir>/worktree-guard/
-  state.json      # 活动 worktree 登记（仓库级单活动）
-  override.json   # 主 checkout 写入授权
+  bindings/       # 会话级绑定（每 session 一文件：<session_id>.json）
+  state.json      # v0.1 兜底：仓库级单活动 worktree + 全局授权标记
   bases.json      # 各 worktree 的 base 分支
+  allowlist.json  # 临时放行条目（带 TTL，过期自动 GC）
+  audit.jsonl     # allow 操作审计日志
+  meta.json       # schema 版本（迁移检测）
 ```
 
-不进版本库、所有 worktree 共享、重启自动恢复。
+不进版本库、所有 worktree 共享（存 git common dir）、重启自动恢复。
+
+### 绑定解析（三层降级）
+
+当前会话的 worktree 绑定按优先级解析：
+
+1. **自身直绑** — `bindings/<session_id>.json`（`enter` 写入，最高优先）
+2. **DB parent 继承** — 子代理（`sess_subagent_*`）经 ZCode SQLite 的 `parent_id` 链继承父绑定，快照到自身
+3. **state.json 兜底** — v0.1 仓库级单活动（跨 session 共享）
+4. **无绑定** — Read 放行，Write/Edit fail-closed 拦截
 
 ## 设计与实现
 
 - **[docs/design.md](docs/design.md)** — 完整设计文档：契约证据（PreToolUse 改写能力的实测验证）、架构决策、审计修正记录、已知边界
-- 纯 TypeScript（`.mjs`），与 ZCode 同栈，零运行时依赖
-- 已端到端验证：24 个命令行场景 + 真实 hook 管道全流程（create → enter → 透明重写 → exit → 授权合并）
+- 纯 Node.js ESM（`.mjs`），与 ZCode 同栈，零运行时依赖
+- **112 个自动化测试用例**（`node --test tests/v2.test.mjs`）：覆盖决策表、Bash 拦截、绑定三层降级、白名单、allowlist、生命周期、SessionStart 等全部子系统
 
 ## License
 
