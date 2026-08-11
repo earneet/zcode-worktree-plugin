@@ -177,9 +177,12 @@ export function protectedBranches(cfg) {
   return set;
 }
 export function whitelistPatterns(cfg) {
-  // v0.2 白名单：声明式放行，这些路径写主目录不重写不拦截
+  // v0.2 白名单：声明式放行，这些路径写主目录不重写不拦截。
+  // 危险裸根模式（*、/、.、** 等）会被 validateWhitelist 剔除，防误配卸保护。
   const wl = cfg.main_write_whitelist;
-  return Array.isArray(wl) ? wl.filter((p) => typeof p === "string" && p.trim()) : [];
+  if (!Array.isArray(wl)) return [];
+  const raw = wl.filter((p) => typeof p === "string" && p.trim());
+  return validateWhitelist(raw).valid;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,15 +194,26 @@ function basesFile(common) { return path.join(stateDirOf(common), "bases.json");
 function metaFile(common) { return path.join(stateDirOf(common), "meta.json"); }
 function bindingsDir(common) { return path.join(stateDirOf(common), "bindings"); }
 function auditFile(common) { return path.join(stateDirOf(common), "audit.jsonl"); }
-function bindingFile(common, sessionId) { return path.join(bindingsDir(common), `${sessionId}.json`); }
+function bindingFile(common, sessionId) { return path.join(bindingsDir(common), `${safeFileName(sessionId)}.json`); }
 
 function readJson(f) {
   if (!fs.existsSync(f)) return null;
   try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; }
 }
 function writeJson(f, data) {
-  fs.mkdirSync(path.dirname(f), { recursive: true });
-  fs.writeFileSync(f, JSON.stringify(data, null, 2), "utf8");
+  // 原子写入：先写临时文件再 rename，避免并发进程读到半写的 JSON。
+  // POSIX rename 原子；Windows rename 也基本原子（同卷下覆盖替换）。
+  const dir = path.dirname(f);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.tmp-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
+  try {
+    fs.renameSync(tmp, f);
+  } catch {
+    // rename 失败（罕见）→ 清理临时文件，回退到直接写（非原子但仍可用）
+    try { fs.unlinkSync(tmp); } catch {}
+    fs.writeFileSync(f, JSON.stringify(data, null, 2), "utf8");
+  }
 }
 function safeFileName(s) { return s.replace(/[^a-zA-Z0-9._-]/g, "-"); }
 
@@ -282,7 +296,17 @@ export function findBindingsForWorktree(common, worktreePath) {
 function allowlistFileRepo(common) { return path.join(stateDirOf(common), "allowlist.json"); }
 
 export function loadAllowlist(common) {
-  return readJson(allowlistFileRepo(common)) || { paths: [] };
+  const al = readJson(allowlistFileRepo(common)) || { paths: [] };
+  if (!al.paths) al.paths = [];
+  // lazy GC：剔除已过期条目，避免 allowlist.json 无限增长。
+  // 仅当确实有过期条目时才回写（避免无谓 IO）。
+  const now = Date.now();
+  const fresh = al.paths.filter((e) => !e.expires_at || new Date(e.expires_at).getTime() >= now);
+  if (fresh.length !== al.paths.length) {
+    al.paths = fresh;
+    saveAllowlist(common, al);
+  }
+  return al;
 }
 
 export function saveAllowlist(common, data) {
@@ -529,7 +553,7 @@ export function extractCdTarget(command, cwd) {
 // v0.2 危险配置校验：白名单不允许裸根/全匹配（防误配卸保护）
 
 export function validateWhitelist(patterns) {
-  // 返回 {valid: bool, dangerous: [patterns]}。危险的裸根模式拒绝。
+  // 返回 {valid: string[], dangerous: string[]}。危险裸根模式（*、/、.、** 等）归入 dangerous。
   const dangerous = [];
   const valid = [];
   for (const p of patterns) {

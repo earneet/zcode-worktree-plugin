@@ -93,12 +93,23 @@ function decideWrite(target, ctx, isWrite) {
     if (C.isInside(nTarget, nWt)) {
       return { action: "allow", source: "inside-worktree" }; // 6. 写副本内
     }
+    // 7. 目标在主 checkout 根下 → 透明重写（但要排除其他 worktree 副本）
     if (C.isInside(nTarget, nRoot)) {
-      // 7. 主 checkout 根下 → 透明重写
+      // 检查目标是否落在另一个已注册 worktree 副本内（跨副本写入）。
+      // worktree 副本常在 root 内（默认 .worktrees/ 下），不检查会被错误重写。
+      // 注意：registeredWorktrees 的第一个条目是主 checkout（path === root），需跳过。
+      for (const wt of C.registeredWorktrees(ctx.root)) {
+        const nOther = C.norm(wt.path);
+        if (nOther === nRoot) continue; // 跳过主 checkout（目标本来就该在 root 内）
+        if (nOther === nWt) continue;   // 跳过自身绑定的副本
+        if (C.isInside(nTarget, nOther)) {
+          return { action: "deny", reason: "目标路径在其他 worktree 副本内，不允许跨副本写入。" };
+        }
+      }
       const rel = path.relative(nRoot, nTarget);
       return { action: "rewrite", newTarget: path.join(binding.worktree, rel), source: "rewrite" };
     }
-    // 8. 其他位置（其他副本等）
+    // 8. root 外、副本外（理论不可达：§2 已放行 root 外）
     return { action: "deny", reason: "目标在其他副本内，不允许跨副本写入。" };
   }
 

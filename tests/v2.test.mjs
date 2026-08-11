@@ -293,21 +293,17 @@ describe("A. decideWrite 决策表（Write/Edit/Read）", () => {
     assertPass(r);
   });
 
-  // §8 cross-worktree — v0.2 已知行为记录
-  it("A08: Write root 内其他 worktree 副本 → 实际被重写（非拦截）", () => {
-    // 设计文档规则表写"写其他副本→拦截"，但 decideWrite 实际逻辑：
-    // .worktrees/ 在 root 内，isInside(nTarget, nRoot)=true → 走 §7 rewrite 而非 §8 deny。
-    // §8 deny 分支只在"root 外但又不是仓库外"时触发，而该条件几乎不可能满足
-    // （root 外的路径已在 §2 被放行）。所以 §8 实际是死代码。
-    // 此测试记录当前真实行为：root 内其他副本路径会被重写到绑定 worktree。
+  // §7/§8 cross-worktree deny（P3 修复后）
+  it("A08: Write 其他 worktree 副本 → 拦截（跨副本写入保护）", () => {
+    // P3 修复：decideWrite 在 §7 rewrite 前检查目标是否落在另一个已注册 worktree 内。
+    // 之前 .worktrees/ 在 root 内会被错误重写，现在正确 deny。
     runWt("create", { task_name: "other" }, { env: { ZCODE_SESSION_ID: "sess_other" }, cwd: repo });
     const otherWt = path.join(repo, ".worktrees", "worktree-other");
     const r = runHook({
       tool_name: "Write", cwd: repo, session_id: sid,
       tool_input: { file_path: path.join(otherWt, "z.js"), content: "z" },
     });
-    // 当前行为：rewrite（把 other 副本路径重写到绑定 worktree 对应位置）
-    assertRewrite(r, wtPath);
+    assertBlock(r, "其他 worktree");
   });
 
   // §7 rewrite (Read)
@@ -1258,5 +1254,150 @@ describe("K. 鲁棒性 / 边界", () => {
       tool_input: { file_path: path.join(repo, "a.js"), content: "x" },
     });
     assertRewrite(r2, wt2Path);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// L. 代码审查修复验证（P0-P5）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("L. 代码审查修复验证", () => {
+  let repo, common;
+  beforeEach(() => { repo = makeRepo(); common = repoCommon(repo); });
+  afterEach(() => cleanupRepo(repo));
+
+  // --- P0: session_id 路径穿越防护 ---
+
+  it("L01: 含 ../ 的 session_id → safeFileName 净化，不穿越目录", () => {
+    const evilSid = "../../etc/evil";
+    // saveBinding 不应写到 bindings/ 之外
+    C.saveBinding(common, evilSid, {
+      worktree: "C:\\wt", branch: "worktree-x", base: "master", source: "self",
+    });
+    // 绑定文件应落在 bindings/ 内，文件名被净化（无 ../）
+    const bindingsDir = path.join(common, "worktree-guard", "bindings");
+    const files = fs.existsSync(bindingsDir) ? fs.readdirSync(bindingsDir) : [];
+    const evilPath = path.join(common, "etc", "evil.json");
+    assert.ok(!fs.existsSync(evilPath), `路径穿越成功！evil 文件被写到: ${evilPath}`);
+    // 净化后的文件应存在
+    assert.ok(files.some((f) => f.endsWith(".json")), "绑定文件应在 bindings/ 内");
+    // 读取时应能取回（sessionId 同样被 safeFileName 处理）
+    const loaded = C.loadBinding(common, evilSid);
+    assert.ok(loaded && loaded.worktree, "save/load 用同一 safeFileName 应能取回");
+  });
+
+  it("L02: 正常 session_id → 不受 safeFileName 影响", () => {
+    const sid = "sess_normal_123";
+    C.saveBinding(common, sid, {
+      worktree: "C:\\wt", branch: "worktree-x", base: "master", source: "self",
+    });
+    assert.deepEqual(C.loadBinding(common, sid)?.worktree, "C:\\wt");
+  });
+
+  // --- P1: writeJson 原子化 ---
+
+  it("L03: writeJson 写入后文件完整可读（无半写）", () => {
+    // 用 saveBaseByCommon（内部走 writeJson）验证写入完整性
+    C.saveBaseByCommon(common, "worktree-x", "develop");
+    C.saveBaseByCommon(common, "worktree-y", "master");
+    const bases = C.loadBasesByCommon(common);
+    assert.equal(bases["worktree-x"], "develop");
+    assert.equal(bases["worktree-y"], "master");
+  });
+
+  it("L04: writeJson 不残留临时文件", () => {
+    C.saveAllowlist(common, { paths: [{ path: "x", reason: "t" }] });
+    const dir = path.join(common, "worktree-guard");
+    const tmpFiles = fs.readdirSync(dir).filter((f) => f.startsWith(".tmp-"));
+    assert.equal(tmpFiles.length, 0, `残留临时文件: ${tmpFiles}`);
+  });
+
+  // --- P2: allowlist 过期条目垃圾回收 ---
+
+  it("L05: loadAllowlist 自动剔除过期条目（lazy GC）", () => {
+    // 直接写入含过期和未过期条目的 allowlist
+    C.saveAllowlist(common, {
+      paths: [
+        { path: "expired.md", expires_at: new Date(Date.now() - 60000).toISOString() },
+        { path: "fresh.md", expires_at: new Date(Date.now() + 60000).toISOString() },
+        { path: "nottl.md" }, // 无 TTL，永不过期
+      ],
+    });
+    const al = C.loadAllowlist(common); // 触发 GC
+    assert.equal(al.paths.length, 2, "过期条目应被 GC 剔除");
+    assert.ok(al.paths.every((e) => e.path !== "expired.md"), "expired.md 不应残留");
+    // 文件应已回写（GC 后）
+    const reread = C.loadAllowlist(common);
+    assert.equal(reread.paths.length, 2, "GC 回写后条目数一致");
+  });
+
+  it("L06: 全部未过期的 allowlist → GC 不触发无谓写", () => {
+    C.saveAllowlist(common, {
+      paths: [{ path: "a.md", expires_at: new Date(Date.now() + 60000).toISOString() }],
+    });
+    const al = C.loadAllowlist(common);
+    assert.equal(al.paths.length, 1);
+    // 再次 load 应仍为 1
+    assert.equal(C.loadAllowlist(common).paths.length, 1);
+  });
+
+  // --- P3: decideWrite 跨副本 deny（端到端，已在 A08 覆盖，这里白盒验证逻辑） ---
+
+  it("L07: 跨副本 deny 端到端 → 其他副本内 Write 被拦截", () => {
+    const sid = "sess_l07";
+    runWt("create", { task_name: "main" }, { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-main" }, { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+    runWt("create", { task_name: "other" }, { env: { ZCODE_SESSION_ID: "sess_other" }, cwd: repo });
+    const otherWt = path.join(repo, ".worktrees", "worktree-other");
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(otherWt, "x.js"), content: "x" },
+    });
+    assertBlock(r, "其他 worktree");
+  });
+
+  // --- P4: whitelistPatterns 过滤危险模式 ---
+
+  it("L08: whitelistPatterns 过滤危险模式（*）→ 不放行裸根", () => {
+    const cfg = { main_write_whitelist: ["*", "AGENTS.md", "docs/**/*.md"] };
+    const patterns = C.whitelistPatterns(cfg);
+    assert.ok(!patterns.includes("*"), "危险模式 * 应被剔除");
+    assert.ok(patterns.includes("AGENTS.md"));
+    assert.ok(patterns.includes("docs/**/*.md"));
+  });
+
+  it("L09: whitelistPatterns 过滤 / 和 .", () => {
+    const cfg = { main_write_whitelist: ["/", ".", "**", "src/*.js"] };
+    const patterns = C.whitelistPatterns(cfg);
+    assert.equal(patterns.length, 1, "仅 src/*.js 合法");
+    assert.ok(patterns.includes("src/*.js"));
+  });
+
+  it("L10: 危险白名单模式端到端 → 不放行（防护生效）", () => {
+    // 配置危险白名单 + 无绑定 → 危险模式被过滤，Write 仍被 fail-closed 拦截
+    fs.mkdirSync(path.join(repo, ".zcode"), { recursive: true });
+    fs.writeFileSync(
+      path.join(repo, ".zcode", "worktree-guard.json"),
+      JSON.stringify({ main_write_whitelist: ["*"] }),
+    );
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: "sess_l10",
+      tool_input: { file_path: path.join(repo, "anything.js"), content: "x" },
+    });
+    // * 被过滤 → 无白名单 → 无绑定 → fail-closed block
+    assertBlock(r);
+  });
+
+  it("L11: 正常白名单端到端 → 放行（未误杀）", () => {
+    fs.mkdirSync(path.join(repo, ".zcode"), { recursive: true });
+    fs.writeFileSync(
+      path.join(repo, ".zcode", "worktree-guard.json"),
+      JSON.stringify({ main_write_whitelist: ["AGENTS.md"] }),
+    );
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: "sess_l11",
+      tool_input: { file_path: path.join(repo, "AGENTS.md"), content: "x" },
+    });
+    assertPass(r);
   });
 });
