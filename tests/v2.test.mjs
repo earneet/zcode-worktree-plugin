@@ -158,7 +158,18 @@ function cleanupRepo(dir) {
       }
     }
   } catch {}
-  fs.rmSync(dir, { recursive: true, force: true });
+  // Windows 上 git 子进程刚退出时可能短暂持有 .git 下句柄，导致 rmSync EPERM。
+  // 重试几次（退避等待句柄释放），仍失败则放弃——临时目录由 OS 清理，
+  // 不应让测试清理的竞态污染测试结果（测试体断言已通过）。
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      const end = Date.now() + 300;
+      while (Date.now() < end) { /* busy-wait ~300ms 让句柄释放 */ }
+    }
+  }
 }
 
 /** 获取仓库的 git common dir */
