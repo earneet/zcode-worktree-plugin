@@ -1,6 +1,6 @@
 {
   "name": "zcode-worktree-guard",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "强制 git worktree 工作流：PreToolUse 透明路径重写 + 主 checkout 写保护 + 危险 git 操作拦截",
   "author": { "name": "earneet" },
   "license": "MIT",
