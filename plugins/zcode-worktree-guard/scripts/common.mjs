@@ -132,9 +132,18 @@ export function registeredWorktrees(root) {
   return result;
 }
 
-export function dirtySummary(p) {
+export function dirtySummary(p, ignorePaths = []) {
   const { stdout } = runGit(["status", "--porcelain"], p, { check: true });
-  const lines = stdout.split(/\r?\n/).filter((l) => l.trim());
+  let lines = stdout.split(/\r?\n/).filter((l) => l.trim());
+  // v0.3：过滤掉 symlink_dirs 等应忽略的路径（它们是链接，不是真正的未提交改动）
+  if (ignorePaths.length) {
+    const normIgnores = ignorePaths.map((d) => norm(d));
+    lines = lines.filter((line) => {
+      const fp = line.slice(3).trim().replace(/\/+$/, "").replace(/^"|"$/g, "");
+      const nfp = norm(fp);
+      return !normIgnores.some((d) => nfp === d || nfp.startsWith(d + path.sep));
+    });
+  }
   return { count: lines.length, sample: lines.slice(0, 10) };
 }
 
@@ -183,6 +192,28 @@ export function whitelistPatterns(cfg) {
   if (!Array.isArray(wl)) return [];
   const raw = wl.filter((p) => typeof p === "string" && p.trim());
   return validateWhitelist(raw).valid;
+}
+
+// v0.3 文件同步配置：worktree 创建后复制文件 / 链接目录（复用 node_modules 等）
+function isSafeRelPath(p) {
+  // 仅接受相对路径，拒绝绝对路径和 .. 穿越（防误删/注入）
+  if (!p || typeof p !== "string") return false;
+  const t = p.trim();
+  if (!t) return false;
+  if (path.isAbsolute(t)) return false;
+  if (t.includes("..")) return false;
+  return true;
+}
+
+export function syncConfig(cfg) {
+  const sync = cfg.sync || {};
+  const copyFiles = Array.isArray(sync.copy_files)
+    ? sync.copy_files.filter(isSafeRelPath)
+    : [];
+  const symlinkDirs = Array.isArray(sync.symlink_dirs)
+    ? sync.symlink_dirs.filter(isSafeRelPath)
+    : [];
+  return { copyFiles, symlinkDirs };
 }
 
 // ---------------------------------------------------------------------------
@@ -566,4 +597,83 @@ export function validateWhitelist(patterns) {
     }
   }
   return { valid, dangerous };
+}
+
+// ---------------------------------------------------------------------------
+// v0.3 文件同步：worktree 创建后复制文件 / 链接目录，清理时安全删除链接
+// 设计参考 opencode-worktree-isolation，但清理安全加强：
+// opencode 清理完全依赖 git worktree remove --force，无 symlink 防护（高危），
+// 本实现在 git remove 前先用 lstat+unlink 安全移除 junction/symlink。
+
+// 创建阶段：复制文件（copy_files）。逐文件 copyFileSync，收集失败不静默吞。
+export function syncCopyFiles(root, wtPath, copyFiles) {
+  const copied = [], skipped = [], failed = [];
+  for (const f of copyFiles) {
+    const src = path.join(root, f);
+    const dst = path.join(wtPath, f);
+    if (!fs.existsSync(src)) { skipped.push(f); continue; }
+    try {
+      const st = fs.lstatSync(src);   // lstat 不跟随：源本身必须是文件
+      if (!st.isFile()) { skipped.push(`${f} (非文件)`); continue; }
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.copyFileSync(src, dst);
+      copied.push(f);
+    } catch (e) {
+      failed.push(`${f}: ${e.message}`);
+    }
+  }
+  return { copied, skipped, failed };
+}
+
+// 创建阶段：链接目录（symlink_dirs）。Windows 用 junction（无需管理员权限），失败回退 dir symlink。
+export function syncSymlinkDirs(root, wtPath, symlinkDirs) {
+  const linked = [], skipped = [], failed = [];
+  const isWin = process.platform === "win32";
+  for (const d of symlinkDirs) {
+    const src = path.join(root, d);
+    const dst = path.join(wtPath, d);
+    if (!fs.existsSync(src)) { skipped.push(d); continue; }
+    try {
+      const st = fs.lstatSync(src);   // lstat：源本身必须是目录
+      if (!st.isDirectory()) { skipped.push(`${d} (非目录)`); continue; }
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      const type = isWin ? "junction" : "dir";
+      try {
+        fs.symlinkSync(src, dst, type);
+      } catch {
+        // junction 失败（罕见）→ 回退普通 dir symlink（需管理员/开发者模式）
+        fs.symlinkSync(src, dst, "dir");
+      }
+      linked.push(d);
+    } catch (e) {
+      failed.push(`${d}: ${e.message}`);
+    }
+  }
+  return { linked, skipped, failed };
+}
+
+// 🔴 清理阶段：安全删除 worktree 内的 symlink/junction（必须在 git worktree remove 前）
+// 关键安全点：
+//   1. 必须 lstatSync（非 statSync）—— statSync 跟随 symlink 会误判为目录
+//   2. 必须 unlinkSync（非 rmSync）—— unlinkSync 只删链接本身，不跟随不递归
+//   3. 只删 isSymbolicLink() 的条目——用户自建的真目录留给 git remove
+// 如果跳过此步直接 git worktree remove，递归删除可能跟随 junction 误删主仓库内容。
+export function removeSyncedLinks(wtPath, symlinkDirs) {
+  const removed = [], skipped = [], failed = [];
+  for (const d of symlinkDirs) {
+    const linkPath = path.join(wtPath, d);
+    if (!fs.existsSync(linkPath)) { skipped.push(d); continue; }
+    try {
+      const st = fs.lstatSync(linkPath);   // 🔴 lstat 不跟随
+      if (st.isSymbolicLink()) {
+        fs.unlinkSync(linkPath);            // 🔴 unlink 只删链接，不递归
+        removed.push(d);
+      } else {
+        skipped.push(`${d} (非链接，可能是真目录)`);
+      }
+    } catch (e) {
+      failed.push(`${d}: ${e.message}`);
+    }
+  }
+  return { removed, skipped, failed };
 }

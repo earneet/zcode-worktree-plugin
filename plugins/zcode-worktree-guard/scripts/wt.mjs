@@ -63,11 +63,33 @@ async function cmdCreate(params, cwd) {
     return fail(`git worktree add 失败: ${e.message}`);
   }
 
+  // v0.3 文件同步：复制文件 + 链接目录（复用 node_modules 等）
+  const { copyFiles, symlinkDirs } = C.syncConfig(cfg);
+  const syncLines = [];
+  if (copyFiles.length || symlinkDirs.length) {
+    if (copyFiles.length) {
+      const cp = C.syncCopyFiles(root, wtPath, copyFiles);
+      if (cp.copied.length) syncLines.push(`复制文件: ${cp.copied.join(", ")}`);
+      if (cp.skipped.length) syncLines.push(`跳过文件: ${cp.skipped.join(", ")}`);
+      if (cp.failed.length) syncLines.push(`⚠️ 复制失败: ${cp.failed.join("; ")}`);
+    }
+    if (symlinkDirs.length) {
+      const sl = C.syncSymlinkDirs(root, wtPath, symlinkDirs);
+      if (sl.linked.length) syncLines.push(`链接目录: ${sl.linked.join(", ")}`);
+      if (sl.skipped.length) syncLines.push(`跳过目录: ${sl.skipped.join(", ")}`);
+      if (sl.failed.length) syncLines.push(`⚠️ 链接失败: ${sl.failed.join("; ")}`);
+    }
+  }
+
   C.saveBaseByCommon(common, branch, base);
   C.ensureMeta(common);
 
   const lines = [`✅ worktree 已创建\n- 路径: ${wtPath}\n- 分支: ${branch}（基于 ${base}）`];
   if (!ignored) lines.push(`- 已将 ${parent}/ 追加到 .git/info/exclude`);
+  if (syncLines.length) {
+    lines.push("- 文件同步:");
+    for (const sl of syncLines) lines.push(`  ${sl}`);
+  }
   lines.push("\n下一步: enter 进入该副本后再做任何文件修改");
   ok(lines.join("\n"));
 }
@@ -127,7 +149,10 @@ async function cmdExit(params, cwd) {
 
   let nDirty = 0;
   if (fs.existsSync(wtPath) && fs.statSync(wtPath).isDirectory()) {
-    const dirty = C.dirtySummary(wtPath);
+    // v0.3：dirtySummary 过滤 symlink_dirs（它们是链接，不是真正的未提交改动）
+    const cfg = C.loadConfig(root);
+    const { symlinkDirs } = C.syncConfig(cfg);
+    const dirty = C.dirtySummary(wtPath, symlinkDirs);
     const ahead = C.aheadSummary(wtPath, base);
     nDirty = dirty.count;
     lines.push(`- 领先 ${base} 的提交: ${ahead.count} 个` + (ahead.sample.length ? "\n  " + ahead.sample.join("\n  ") : ""));
@@ -152,6 +177,15 @@ async function cmdExit(params, cwd) {
   if (action === "remove") {
     if (!confirmRemove) return fail("action=remove 需要 confirm_remove=true。\n" + lines.join("\n"));
     if (nDirty) return fail("工作区有未提交改动，拒绝删除。\n" + lines.join("\n"));
+    // 🔴 v0.3 安全清理：先删除 worktree 内的 symlink/junction，再 git worktree remove。
+    // 不先删 junction 直接递归删除可能跟随链接误删主仓库内容（如 node_modules）。
+    const cfg = C.loadConfig(root);
+    const { symlinkDirs } = C.syncConfig(cfg);
+    if (symlinkDirs.length) {
+      const rmLink = C.removeSyncedLinks(wtPath, symlinkDirs);
+      if (rmLink.removed.length) lines.push(`- 已安全移除链接: ${rmLink.removed.join(", ")}`);
+      if (rmLink.failed.length) lines.push(`- ⚠️ 移除链接失败: ${rmLink.failed.join("; ")}`);
+    }
     const r = C.runGit(["worktree", "remove", wtPath], root);
     if (r.code !== 0) return fail(`git worktree remove 失败: ${r.stdout}\n` + lines.join("\n"));
     lines.push(`🗑️ 副本目录已删除（分支 ${branch} 保留）`);

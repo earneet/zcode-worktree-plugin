@@ -1412,3 +1412,157 @@ describe("L. 代码审查修复验证", () => {
     assertPass(r);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// M. v0.3 文件同步：copyFiles / symlinkDirs / junction + 清理安全
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("M. v0.3 文件同步 + 清理安全", () => {
+  let repo;
+  beforeEach(() => { repo = makeRepo(); });
+  afterEach(() => cleanupRepo(repo));
+
+  // --- syncConfig 路径校验 ---
+
+  it("M01: syncConfig 正常解析 copy_files + symlink_dirs", () => {
+    const cfg = { sync: { copy_files: ["package.json", ".env"], symlink_dirs: ["node_modules"] } };
+    const { copyFiles, symlinkDirs } = C.syncConfig(cfg);
+    assert.deepEqual(copyFiles, ["package.json", ".env"]);
+    assert.deepEqual(symlinkDirs, ["node_modules"]);
+  });
+
+  it("M02: syncConfig 拒绝绝对路径和 .. 穿越", () => {
+    const cfg = { sync: { copy_files: ["/etc/passwd", "../evil", "ok.txt"], symlink_dirs: ["C:\\evil", "..\\node_modules"] } };
+    const { copyFiles, symlinkDirs } = C.syncConfig(cfg);
+    assert.deepEqual(copyFiles, ["ok.txt"]);
+    assert.deepEqual(symlinkDirs, []);
+  });
+
+  it("M03: syncConfig 无 sync 配置 → 空数组", () => {
+    const { copyFiles, symlinkDirs } = C.syncConfig({});
+    assert.deepEqual(copyFiles, []);
+    assert.deepEqual(symlinkDirs, []);
+  });
+
+  // --- syncCopyFiles 白盒 ---
+
+  it("M04: syncCopyFiles 正常复制文件", () => {
+    fs.writeFileSync(path.join(repo, "package.json"), '{"name":"test"}');
+    const wtPath = path.join(repo, ".worktrees", "wt-m04");
+    fs.mkdirSync(wtPath, { recursive: true });
+    const r = C.syncCopyFiles(repo, wtPath, ["package.json"]);
+    assert.deepEqual(r.copied, ["package.json"]);
+    assert.equal(r.failed.length, 0);
+    assert.ok(fs.existsSync(path.join(wtPath, "package.json")));
+    assert.equal(fs.readFileSync(path.join(wtPath, "package.json"), "utf8"), '{"name":"test"}');
+  });
+
+  it("M05: syncCopyFiles 源不存在 → 跳过", () => {
+    const wtPath = path.join(repo, ".worktrees", "wt-m05");
+    fs.mkdirSync(wtPath, { recursive: true });
+    const r = C.syncCopyFiles(repo, wtPath, ["nonexistent.txt"]);
+    assert.deepEqual(r.skipped, ["nonexistent.txt"]);
+    assert.equal(r.copied.length, 0);
+  });
+
+  it("M06: syncCopyFiles 源是目录 → 跳过（copyFileSync 只复制文件）", () => {
+    fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+    const wtPath = path.join(repo, ".worktrees", "wt-m06");
+    fs.mkdirSync(wtPath, { recursive: true });
+    const r = C.syncCopyFiles(repo, wtPath, ["src"]);
+    assert.equal(r.copied.length, 0);
+    assert.equal(r.skipped.length, 1);
+  });
+
+  // --- syncSymlinkDirs 白盒 ---
+
+  it("M07: syncSymlinkDirs 创建链接（Windows junction / 其他平台 dir symlink）", () => {
+    fs.mkdirSync(path.join(repo, "node_modules"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "node_modules", "leftpad"), "x");
+    const wtPath = path.join(repo, ".worktrees", "wt-m07");
+    fs.mkdirSync(wtPath, { recursive: true });
+    const r = C.syncSymlinkDirs(repo, wtPath, ["node_modules"]);
+    if (r.failed.length === 0) {
+      assert.deepEqual(r.linked, ["node_modules"]);
+      assert.ok(fs.existsSync(path.join(wtPath, "node_modules", "leftpad")));
+    }
+    // CI/沙箱环境可能无 symlink 权限，failed 非空时容忍
+  });
+
+  it("M08: syncSymlinkDirs 源不存在 → 跳过", () => {
+    const wtPath = path.join(repo, ".worktrees", "wt-m08");
+    fs.mkdirSync(wtPath, { recursive: true });
+    const r = C.syncSymlinkDirs(repo, wtPath, ["nonexistent"]);
+    assert.deepEqual(r.skipped, ["nonexistent"]);
+    assert.equal(r.linked.length, 0);
+  });
+
+  // --- 🔴 清理安全（最关键测试） ---
+
+  it("M09: 🔴 removeSyncedLinks 用 lstat 识别 symlink，unlink 只删链接不删目标", () => {
+    fs.mkdirSync(path.join(repo, "node_modules"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "node_modules", "important"), "主仓库数据");
+    const wtPath = path.join(repo, ".worktrees", "wt-m09");
+    fs.mkdirSync(wtPath, { recursive: true });
+    const sl = C.syncSymlinkDirs(repo, wtPath, ["node_modules"]);
+    if (sl.failed.length > 0) return; // 无 symlink 权限时跳过
+    assert.ok(fs.lstatSync(path.join(wtPath, "node_modules")).isSymbolicLink());
+    const rm = C.removeSyncedLinks(wtPath, ["node_modules"]);
+    assert.deepEqual(rm.removed, ["node_modules"]);
+    assert.equal(rm.failed.length, 0);
+    // 🔴 核心断言：主仓库的 node_modules 仍完整
+    assert.ok(fs.existsSync(path.join(repo, "node_modules", "important")),
+      "清理后主仓库 node_modules 被误删！");
+    assert.equal(fs.readFileSync(path.join(repo, "node_modules", "important"), "utf8"), "主仓库数据");
+    assert.ok(!fs.existsSync(path.join(wtPath, "node_modules")));
+  });
+
+  it("M10: 🔴 removeSyncedLinks 对真目录不删（留给 git remove）", () => {
+    const wtPath = path.join(repo, ".worktrees", "wt-m10");
+    fs.mkdirSync(path.join(wtPath, "real-dir"), { recursive: true });
+    fs.writeFileSync(path.join(wtPath, "real-dir", "file"), "x");
+    const rm = C.removeSyncedLinks(wtPath, ["real-dir"]);
+    assert.equal(rm.removed.length, 0, "真目录不应被 removeSyncedLinks 删除");
+    assert.equal(rm.skipped.length, 1);
+    assert.ok(fs.existsSync(path.join(wtPath, "real-dir", "file")));
+  });
+
+  // --- 端到端：create → exit(remove) 含 symlinkDirs 的清理安全 ---
+
+  it("M11: 🔴 端到端 create(含symlinkDirs) → exit(remove) → 主仓库目标完整", () => {
+    fs.mkdirSync(path.join(repo, "node_modules"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "node_modules", "pkg"), "共享依赖");
+    fs.mkdirSync(path.join(repo, ".zcode"), { recursive: true });
+    fs.writeFileSync(
+      path.join(repo, ".zcode", "worktree-guard.json"),
+      JSON.stringify({ sync: { symlink_dirs: ["node_modules"] } }),
+    );
+    const sid = "sess_m11";
+    const env = { ZCODE_SESSION_ID: sid };
+    const cr = runWt("create", { task_name: "feat" }, { env, cwd: repo });
+    assertWtOk(cr, "worktree 已创建");
+    const wtNodeModules = path.join(repo, ".worktrees", "worktree-feat", "node_modules");
+    if (!fs.existsSync(wtNodeModules)) return; // symlink 权限不足跳过
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { env, cwd: repo });
+    const er = runWt("exit", { action: "remove", confirm_remove: true }, { env, cwd: repo });
+    assertWtOk(er, "副本目录已删除");
+    // 🔴 核心安全断言：主仓库 node_modules 完整
+    assert.ok(fs.existsSync(path.join(repo, "node_modules", "pkg")),
+      "exit(remove) 后主仓库 node_modules 被误删！");
+    assert.equal(fs.readFileSync(path.join(repo, "node_modules", "pkg"), "utf8"), "共享依赖");
+  });
+
+  it("M12: 端到端 create(含copyFiles) → 文件已复制到 worktree", () => {
+    fs.writeFileSync(path.join(repo, ".env"), "SECRET=abc");
+    fs.mkdirSync(path.join(repo, ".zcode"), { recursive: true });
+    fs.writeFileSync(
+      path.join(repo, ".zcode", "worktree-guard.json"),
+      JSON.stringify({ sync: { copy_files: [".env"] } }),
+    );
+    const cr = runWt("create", { task_name: "feat" }, { env: { ZCODE_SESSION_ID: "sess_m12" }, cwd: repo });
+    assertWtOk(cr, "worktree 已创建");
+    const copied = path.join(repo, ".worktrees", "worktree-feat", ".env");
+    assert.ok(fs.existsSync(copied), ".env 应已复制到 worktree");
+    assert.equal(fs.readFileSync(copied, "utf8"), "SECRET=abc");
+  });
+});
