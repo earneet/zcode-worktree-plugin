@@ -50,6 +50,7 @@
 | 🔍 **Bash cd 解析** | 从命令串提取 `cd` 目标，跨会话目录也能定位真实工作位置 |
 | 🔗 **会话级绑定 + 继承** | 每 session 独立绑定，子代理经 DB parent 链自动继承父 worktree |
 | 🚪 **双层逃生口** | 声明式白名单（`main_write_whitelist`）+ 临时 allow 放行（带 TTL + 审计） |
+| 📂 **文件同步** | worktree 创建后自动复制文件（`copy_files`）+ 链接目录（`symlink_dirs`，Windows junction 无需管理员权限） |
 | 🪶 **零依赖** | 纯 Node.js 标准库（ESM `.mjs`），与 ZCode 同栈 |
 
 ## 安装
@@ -139,7 +140,11 @@ echo '{}' | node <plugin>/scripts/wt.mjs revoke-main
   "branch_prefix": "worktree-",
   "worktree_parent": ".worktrees",
   "protected_branches": ["master", "main"],
-  "main_write_whitelist": ["AGENTS.md", "docs/**/*.md"]
+  "main_write_whitelist": ["AGENTS.md", "docs/**/*.md"],
+  "sync": {
+    "copy_files": [".env", "package.json"],
+    "symlink_dirs": ["node_modules", ".venv"]
+  }
 }
 ```
 
@@ -149,6 +154,8 @@ echo '{}' | node <plugin>/scripts/wt.mjs revoke-main
 | `worktree_parent` | worktree 副本父目录（默认 `.worktrees`） |
 | `protected_branches` | 额外受保护分支（默认含 `master`、`main`） |
 | `main_write_whitelist` | 声明式白名单：这些路径写主目录不重写不拦截（glob 支持 `*`/`**`/`?`）。危险裸根模式（`*`、`/`、`.` 等）会被自动过滤 |
+| `sync.copy_files` | worktree 创建后从主 checkout 复制的文件列表（相对路径，如 `.env`、`package.json`） |
+| `sync.symlink_dirs` | worktree 创建后从主 checkout 链接的目录列表（相对路径，如 `node_modules`）。Windows 用 junction（无需管理员权限），其他平台用 dir symlink。清理 worktree 时先安全移除链接，避免递归删除误删主仓库内容 |
 
 ### 临时放行（allow 逃生口）
 
