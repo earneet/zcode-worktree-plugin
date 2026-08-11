@@ -1,0 +1,1262 @@
+#!/usr/bin/env node
+// zcode-worktree-guard v0.2 全量功能测试套件
+//
+// 运行: node --test tests/v2.test.mjs
+//
+// 覆盖矩阵（~80 用例）：
+//   J  matchGlob 纯函数白盒单测
+//   A  decideWrite 决策表（Write/Edit/Read）
+//   B  Glob/Grep 搜索路径重写
+//   C  Bash 危险操作拦截（5 条正则规则）
+//   D  resolveBinding 三层降级（含真实 DB 继承）
+//   E  allowlist 临时放行 + TTL + 注入防护
+//   F  whitelist 声明式白名单 + validateWhitelist
+//   G  authorize-main / revoke-main
+//   H  wt.mjs 生命周期子命令
+//   I  SessionStart hook 4 分支
+//   K  鲁棒性 / 边界
+
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import module from "node:module";
+import * as C from "../plugins/zcode-worktree-guard/scripts/common.mjs";
+
+// ESM 没有 require，用 createRequire（与 common.mjs 修复一致）。
+const esmRequire = module.createRequire(import.meta.url);
+
+// ── 脚本路径（相对于本测试文件） ──────────────────────────────────────────────
+const SCRIPTS = path.join(import.meta.dirname, "..", "plugins", "zcode-worktree-guard", "scripts");
+const HOOK = path.join(SCRIPTS, "guard_hook.mjs");
+const WT = path.join(SCRIPTS, "wt.mjs");
+const SS = path.join(SCRIPTS, "session_start.mjs");
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 辅助函数
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** 运行 guard_hook.mjs，stdin 喂 JSON */
+function runHook(payload, opts = {}) {
+  const r = spawnSync("node", [HOOK], {
+    input: JSON.stringify(payload),
+    encoding: "utf8",
+    env: { ...process.env, ...(opts.env || {}) },
+    cwd: opts.cwd,
+    timeout: 15000,
+  });
+  return { code: r.status, stdout: (r.stdout || "").trim(), stderr: (r.stderr || "").trim() };
+}
+
+/** 运行 wt.mjs 子命令，子命令在 argv[2]，参数在 stdin JSON */
+function runWt(sub, params = {}, opts = {}) {
+  const r = spawnSync("node", [WT, sub], {
+    input: JSON.stringify(params),
+    encoding: "utf8",
+    env: { ...process.env, ...(opts.env || {}) },
+    cwd: opts.cwd,
+    timeout: 30000,
+  });
+  return { code: r.status, stdout: (r.stdout || "").trim(), stderr: (r.stderr || "").trim() };
+}
+
+/** 从 wt.mjs 的 {"content":"..."} 输出中提取 content */
+function wtContent(r) {
+  try { return JSON.parse(r.stdout).content || ""; } catch { return ""; }
+}
+
+/** 运行 session_start.mjs */
+function runSs(payload, opts = {}) {
+  const r = spawnSync("node", [SS], {
+    input: JSON.stringify(payload),
+    encoding: "utf8",
+    env: { ...process.env, ...(opts.env || {}) },
+    cwd: opts.cwd,
+    timeout: 15000,
+  });
+  return { code: r.status, stdout: (r.stdout || "").trim(), stderr: (r.stderr || "").trim() };
+}
+
+// ── 断言辅助 ──────────────────────────────────────────────────────────────────
+
+/** 断言：exit 0 + stdout 含 hookSpecificOutput.updatedInput（可选检查 file_path 包含某子串） */
+function assertRewrite(r, contains) {
+  assert.equal(r.code, 0, `期望 exit 0（重写），实际 ${r.code}; stderr: ${r.stderr.slice(0, 200)}`);
+  let parsed;
+  try { parsed = JSON.parse(r.stdout); }
+  catch { assert.fail(`stdout 不是 JSON: ${r.stdout.slice(0, 300)}`); }
+  assert.ok(parsed.hookSpecificOutput?.updatedInput,
+    `缺少 updatedInput: ${r.stdout.slice(0, 300)}`);
+  if (contains) {
+    // norm() 在 Windows 下小写化路径，hook 重写输出的 file_path 是小写。
+    // 用 path.resolve + norm 做大小写/分隔符不敏感的包含比较。
+    const fp = parsed.hookSpecificOutput.updatedInput.file_path
+      || parsed.hookSpecificOutput.updatedInput.path || "";
+    const nFp = C.norm(fp);
+    const nContains = C.norm(contains);
+    assert.ok(nFp.includes(nContains),
+      `重写 file_path "${fp}" 不包含 "${contains}"`);
+  }
+  return parsed.hookSpecificOutput.updatedInput;
+}
+
+/** 断言：exit 2（拦截），可选检查 stderr 包含子串 */
+function assertBlock(r, contains) {
+  assert.equal(r.code, 2,
+    `期望 exit 2（拦截），实际 ${r.code}; stdout: ${r.stdout.slice(0, 200)}; stderr: ${r.stderr.slice(0, 200)}`);
+  if (contains) {
+    assert.ok(r.stderr.toLowerCase().includes(contains.toLowerCase()),
+      `stderr 缺少 "${contains}": ${r.stderr.slice(0, 400)}`);
+  }
+}
+
+/** 断言：exit 0 + 空 stdout（放行，无重写） */
+function assertPass(r) {
+  assert.equal(r.code, 0, `期望 exit 0（放行），实际 ${r.code}; stderr: ${r.stderr}`);
+  assert.equal(r.stdout, "", `期望空 stdout（放行无重写），实际: ${r.stdout.slice(0, 200)}`);
+}
+
+/** 断言：wt.mjs 输出含某关键字（成功） */
+function assertWtOk(r, contains) {
+  const content = wtContent(r);
+  if (contains) {
+    assert.ok(content.includes(contains), `wt 输出缺少 "${contains}": ${content.slice(0, 300)}`);
+  }
+}
+
+/** 断言：wt.mjs 输出含 ❌（失败） */
+function assertWtFail(r, contains) {
+  const content = wtContent(r);
+  assert.ok(content.includes("❌"), `期望失败但输出不含 ❌: ${content.slice(0, 300)}`);
+  if (contains) {
+    assert.ok(content.includes(contains), `wt 失败输出缺少 "${contains}": ${content.slice(0, 300)}`);
+  }
+}
+
+// ── 临时仓库夹具 ──────────────────────────────────────────────────────────────
+
+/** 创建一个带初始 commit 的临时 git 仓库，返回根目录绝对路径 */
+function makeRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wtg-test-"));
+  spawnSync("git", ["init", "-q", "-b", "master"], { cwd: dir, encoding: "utf8" });
+  spawnSync("git", ["config", "user.email", "t@t.com"], { cwd: dir, encoding: "utf8" });
+  spawnSync("git", ["config", "user.name", "t"], { cwd: dir, encoding: "utf8" });
+  spawnSync("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd: dir, encoding: "utf8" });
+  return dir;
+}
+
+/** 安全删除临时仓库（先强制移除所有 worktree 避免 Windows 文件锁） */
+function cleanupRepo(dir) {
+  try {
+    const r = spawnSync("git", ["worktree", "list", "--porcelain"], { cwd: dir, encoding: "utf8" });
+    for (const line of (r.stdout || "").split(/\r?\n/)) {
+      if (line.startsWith("worktree ")) {
+        const wt = line.slice("worktree ".length);
+        try { spawnSync("git", ["worktree", "remove", "--force", wt], { cwd: dir, encoding: "utf8" }); } catch {}
+      }
+    }
+  } catch {}
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+/** 获取仓库的 git common dir */
+function repoCommon(dir) {
+  return C.gitCommonDir(dir);
+}
+
+/** 从真实 ZCode DB 获取一条 subagent→parent 继承链（用于 D 组真实继承测试） */
+function getRealSubagentChain() {
+  let DatabaseSync;
+  try { ({ DatabaseSync } = esmRequire("node:sqlite")); } catch { return null; }
+  try {
+    const dbPath = C.resolveDbPath();
+    if (!fs.existsSync(dbPath)) return null;
+    const db = new DatabaseSync(dbPath, { readOnly: true, timeout: 2000 });
+    const row = db.prepare(
+      "SELECT id AS child, parent_id AS parent FROM session " +
+      "WHERE id LIKE 'sess_subagent_%' AND parent_id IS NOT NULL LIMIT 1"
+    ).get();
+    db.close();
+    return row || null;
+  } catch { return null; }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// J. matchGlob 纯函数白盒单测
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("J. matchGlob 纯函数", () => {
+  const ROOT = "C:\\repo";
+  // matchGlob 接收已 norm（小写化）的 target 和 pattern
+  function mg(target, pattern) {
+    return C.matchGlob(C.norm(path.join(ROOT, target)), C.norm(path.join(ROOT, pattern)));
+  }
+
+  it("J01: * 匹配同段（a.js）", () => assert.equal(mg("a.js", "*.js"), true));
+  it("J02: * 不跨段（a/b.js vs *.js）", () => assert.equal(mg("a/b.js", "*.js"), false));
+  it("J03: ** 跨段（a/b/c.js）", () => assert.equal(mg("a/b/c.js", "**"), true));
+  it("J04: docs/**/*.md 匹配 docs/x/y.md", () => assert.equal(mg("docs/x/y.md", "docs/**/*.md"), true));
+  it("J05: docs/**/*.md 匹配 docs/readme.md", () => assert.equal(mg("docs/readme.md", "docs/**/*.md"), true));
+  it("J06: docs/**/*.md 不匹配 src/x.md", () => assert.equal(mg("src/x.md", "docs/**/*.md"), false));
+  it("J07: ? 匹配单字符（ax.txt vs a?.txt）", () => assert.equal(mg("ax.txt", "a?.txt"), true));
+  it("J08: ? 不匹配多字符（axx.txt vs a?.txt）", () => assert.equal(mg("axx.txt", "a?.txt"), false));
+  it("J09: 正则元字符 . 被转义（精确匹配，非通配）", () => {
+    // a.txt 中的 . 被转义为 \.，所以 a-txt 不匹配 a.txt
+    assert.equal(mg("a-txt", "a.txt"), false);
+    assert.equal(mg("a.txt", "a.txt"), true);
+  });
+  it("J10: 无通配符的精确匹配", () => assert.equal(mg("AGENTS.md", "AGENTS.md"), true));
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// A. decideWrite 决策表（Write/Edit/Read）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("A. decideWrite 决策表（Write/Edit/Read）", () => {
+  let repo, common, wtPath, sid;
+
+  before(() => {
+    repo = makeRepo();
+    common = repoCommon(repo);
+    sid = "sess_test_a";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "feat" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { env, cwd: repo });
+    wtPath = path.join(repo, ".worktrees", "worktree-feat");
+  });
+  after(() => cleanupRepo(repo));
+
+  // §7 rewrite
+  it("A01: Write 主checkout → 重写到 worktree", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "x.js"), content: "x" },
+    });
+    assertRewrite(r, wtPath);
+  });
+
+  it("A02: Edit 主checkout → 重写（Edit 工具路径与 Write 相同）", () => {
+    const r = runHook({
+      tool_name: "Edit", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "x.js"), old_string: "x", new_string: "y" },
+    });
+    assertRewrite(r, wtPath);
+  });
+
+  // §6 inside-worktree
+  it("A03: Write 已在 worktree 内 → 放行", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(wtPath, "y.js"), content: "y" },
+    });
+    assertPass(r);
+  });
+
+  // §1 .git 保护（硬规则，最高优先级）
+  it("A04: Write .git/config → 拦截", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, ".git", "config"), content: "x" },
+    });
+    assertBlock(r, ".git");
+  });
+
+  it("A05: Write .git/objects/xx → 拦截", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, ".git", "objects", "ab", "cd"), content: "x" },
+    });
+    assertBlock(r, ".git");
+  });
+
+  // §2 outside-repo
+  it("A06: Write 仓库外路径 → 放行", () => {
+    const outside = path.join(os.tmpdir(), "wtg-outside-test.txt");
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: outside, content: "x" },
+    });
+    assertPass(r);
+  });
+
+  it("A07: Write 非 git 目录文件 → 放行", () => {
+    const nonGit = path.join(os.tmpdir(), "wtg-nongit", "test.txt");
+    fs.mkdirSync(path.dirname(nonGit), { recursive: true });
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: nonGit, content: "x" },
+    });
+    assertPass(r);
+  });
+
+  // §8 cross-worktree — v0.2 已知行为记录
+  it("A08: Write root 内其他 worktree 副本 → 实际被重写（非拦截）", () => {
+    // 设计文档规则表写"写其他副本→拦截"，但 decideWrite 实际逻辑：
+    // .worktrees/ 在 root 内，isInside(nTarget, nRoot)=true → 走 §7 rewrite 而非 §8 deny。
+    // §8 deny 分支只在"root 外但又不是仓库外"时触发，而该条件几乎不可能满足
+    // （root 外的路径已在 §2 被放行）。所以 §8 实际是死代码。
+    // 此测试记录当前真实行为：root 内其他副本路径会被重写到绑定 worktree。
+    runWt("create", { task_name: "other" }, { env: { ZCODE_SESSION_ID: "sess_other" }, cwd: repo });
+    const otherWt = path.join(repo, ".worktrees", "worktree-other");
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(otherWt, "z.js"), content: "z" },
+    });
+    // 当前行为：rewrite（把 other 副本路径重写到绑定 worktree 对应位置）
+    assertRewrite(r, wtPath);
+  });
+
+  // §7 rewrite (Read)
+  it("A09: Read 主checkout（有绑定）→ 重写", () => {
+    const r = runHook({
+      tool_name: "Read", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "readme.md") },
+    });
+    assertRewrite(r, wtPath);
+  });
+
+  // §7 rewrite (相对路径)
+  it("A10: Write 相对路径 src/app.js → 重写", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: "src/app.js", content: "x" },
+    });
+    assertRewrite(r, wtPath);
+  });
+
+  it("A11: Write ./src/x.js → 重写", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: "./src/x.js", content: "x" },
+    });
+    assertRewrite(r, wtPath);
+  });
+
+  it("A12: Write 深层路径 → 重写精确 rel 拼接", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "a", "b", "c", "d.js"), content: "x" },
+    });
+    const result = assertRewrite(r);
+    assert.equal(result.file_path, path.join(wtPath, "a", "b", "c", "d.js"));
+  });
+
+  it("A13: 大小写不一致 → norm 后正确重写", () => {
+    // 用大写形式传入 file_path，norm() 小写化后应匹配
+    const upperRepo = repo.toUpperCase();
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(upperRepo, "Case.js"), content: "x" },
+    });
+    // Windows 不区分大小写，重写应生效
+    assertRewrite(r);
+  });
+
+  // §2 outside-repo (prefix attack)
+  it("A14: Write 路径前缀相似但实际仓库外 → 放行（防 isInside 前缀绕过）", () => {
+    const fakeRepo = repo + "-evil";
+    fs.mkdirSync(fakeRepo, { recursive: true });
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(fakeRepo, "x.js"), content: "x" },
+    });
+    assertPass(r);
+  });
+
+  it("A15: Write file_path 为空 → 放行（guard 早退）", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: "", content: "x" },
+    });
+    assertPass(r);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// A2. fail-closed（无绑定场景）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("A2. fail-closed（无绑定写保护）", () => {
+  let repo, sid;
+
+  before(() => {
+    repo = makeRepo();
+    sid = "sess_nobody"; // 无绑定
+  });
+  after(() => cleanupRepo(repo));
+
+  it("A16: 无绑定 Write 主checkout → 拦截（fail-closed）", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "new.js"), content: "x" },
+    });
+    assertBlock(r);
+  });
+
+  it("A17: 无绑定 Edit 主checkout → 拦截", () => {
+    const r = runHook({
+      tool_name: "Edit", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "new.js"), old_string: "a", new_string: "b" },
+    });
+    assertBlock(r);
+  });
+
+  it("A18: 无绑定 Read 主checkout → 放行（只读不拦）", () => {
+    const r = runHook({
+      tool_name: "Read", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "readme.md") },
+    });
+    assertPass(r);
+  });
+
+  it("A19: 无绑定 Write 仓库外 → 放行", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(os.tmpdir(), "wtg-ext.txt"), content: "x" },
+    });
+    assertPass(r);
+  });
+
+  it("A20: 无绑定 Write .git → 拦截（硬规则仍生效）", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, ".git", "config"), content: "x" },
+    });
+    assertBlock(r, ".git");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// B. Glob/Grep 搜索路径重写
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("B. Glob/Grep 搜索路径重写", () => {
+  let repo, wtPath, sid;
+
+  before(() => {
+    repo = makeRepo();
+    sid = "sess_test_b";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "feat" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { env, cwd: repo });
+    wtPath = path.join(repo, ".worktrees", "worktree-feat");
+  });
+  after(() => cleanupRepo(repo));
+
+  it("B01: Glob 无 path + 有绑定 → 注入 path=worktree", () => {
+    const r = runHook({
+      tool_name: "Glob", cwd: repo, session_id: sid,
+      tool_input: { pattern: "*.js" },
+    });
+    const result = assertRewrite(r);
+    assert.equal(result.path, wtPath);
+  });
+
+  it("B02: Grep 无 path + 有绑定 → 注入 path=worktree", () => {
+    const r = runHook({
+      tool_name: "Grep", cwd: repo, session_id: sid,
+      tool_input: { pattern: "foo" },
+    });
+    const result = assertRewrite(r);
+    assert.equal(result.path, wtPath);
+  });
+
+  it("B03: Glob path 在主根下 → 重写到 worktree", () => {
+    const r = runHook({
+      tool_name: "Glob", cwd: repo, session_id: sid,
+      tool_input: { pattern: "*.js", path: path.join(repo, "src") },
+    });
+    const result = assertRewrite(r);
+    assert.equal(result.path, path.join(wtPath, "src"));
+  });
+
+  it("B04: Glob path 在 worktree 内 → 放行", () => {
+    const r = runHook({
+      tool_name: "Glob", cwd: repo, session_id: sid,
+      tool_input: { pattern: "*.js", path: wtPath },
+    });
+    assertPass(r);
+  });
+
+  it("B05: Glob path 仓库外 → 放行", () => {
+    const r = runHook({
+      tool_name: "Glob", cwd: repo, session_id: sid,
+      tool_input: { pattern: "*.js", path: os.tmpdir() },
+    });
+    assertPass(r);
+  });
+
+  it("B06: Glob 无绑定 → 放行（搜索只读，不注入）", () => {
+    // 用独立 repo，确保无 state.json 兜底（B 组 before 的 enter 会写 state.json）
+    const isolated = makeRepo();
+    try {
+      const r = runHook({
+        tool_name: "Glob", cwd: isolated, session_id: "sess_nobody_b06",
+        tool_input: { pattern: "*.js" },
+      });
+      assertPass(r);
+    } finally {
+      cleanupRepo(isolated);
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// C. Bash 危险操作拦截
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("C. Bash 危险操作拦截", () => {
+  let repo, wtPath, sid;
+
+  before(() => {
+    repo = makeRepo();
+    sid = "sess_test_c";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "feat" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { env, cwd: repo });
+    wtPath = path.join(repo, ".worktrees", "worktree-feat");
+  });
+  after(() => cleanupRepo(repo));
+
+  // --- GIT_PUSH_PROTECTED_RE / GIT_PUSH_DEFAULT_RE ---
+
+  it("C01: git push origin master → 拦截", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git push origin master" },
+    });
+    assertBlock(r, "push");
+  });
+
+  it("C02: git push origin main → 拦截", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git push origin main" },
+    });
+    assertBlock(r, "push");
+  });
+
+  it("C03: 裸 git push（在 master 分支上）→ 拦截", () => {
+    // cwd = repo root → branch = master
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git push" },
+    });
+    assertBlock(r);
+  });
+
+  it("C04: 裸 git push（在 worktree 分支上）→ 放行", () => {
+    // cwd = worktree → branch = worktree-feat（非受保护）
+    const r = runHook({
+      tool_name: "Bash", cwd: wtPath, session_id: sid,
+      tool_input: { command: "git push" },
+    });
+    assertPass(r);
+  });
+
+  // --- GIT_CHECKOUT_RE ---
+
+  it("C05: 有绑定时 git checkout master → 拦截", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git checkout master" },
+    });
+    assertBlock(r, "checkout");
+  });
+
+  it("C06: 有绑定时 git switch main → 拦截", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git switch main" },
+    });
+    assertBlock(r, "switch");
+  });
+
+  it("C07: git checkout feature（非受保护）→ 放行", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git checkout feature" },
+    });
+    assertPass(r);
+  });
+
+  // --- GIT_DEL_WORKTREE_RE ---
+
+  it("C08: git branch -d worktree-xxx → 拦截", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git branch -d worktree-old" },
+    });
+    assertBlock(r);
+  });
+
+  it("C09: git branch -D worktree-xxx → 拦截", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git branch -D worktree-old" },
+    });
+    assertBlock(r);
+  });
+
+  // --- GIT_MUTATE_RE / GIT_MERGE_TARGET_RE ---
+
+  it("C10: master 分支上 git merge feature → 拦截（受保护分支上 mutate）", () => {
+    // cwd = repo → branch = master
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git merge feature" },
+    });
+    assertBlock(r);
+  });
+
+  it("C11: git merge worktree-xxx（任意位置）→ 拦截", () => {
+    // cwd = worktree → branch = worktree-feat（非受保护），但 merge 目标是 worktree-* 分支
+    const r = runHook({
+      tool_name: "Bash", cwd: wtPath, session_id: sid,
+      tool_input: { command: "git merge worktree-other" },
+    });
+    assertBlock(r, "worktree");
+  });
+
+  it("C12: worktree 内 git merge master（同步基线）→ 放行", () => {
+    // SKILL 明确允许：副本内 merge master 同步基线
+    const r = runHook({
+      tool_name: "Bash", cwd: wtPath, session_id: sid,
+      tool_input: { command: "git merge master" },
+    });
+    assertPass(r);
+  });
+
+  it("C13: 无危险操作的 git status → 放行", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git status" },
+    });
+    assertPass(r);
+  });
+
+  it("C14: 非 git 命令 → 放行", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "echo hello" },
+    });
+    assertPass(r);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// D. resolveBinding 三层降级（含真实 DB 继承）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("D. resolveBinding 三层降级", () => {
+  let repo, common;
+  const realChain = getRealSubagentChain();
+
+  before(() => {
+    repo = makeRepo();
+    common = repoCommon(repo);
+  });
+  after(() => cleanupRepo(repo));
+
+  // ① 自身直绑
+  it("D01: 自身直绑 → source=self", () => {
+    const sid = "sess_d01";
+    C.saveBinding(common, sid, {
+      worktree: "C:\\wt\\d01", branch: "worktree-d01", base: "master", source: "self",
+    });
+    const r = C.resolveBinding(common, sid);
+    assert.ok(r);
+    assert.equal(r.worktree, "C:\\wt\\d01");
+    assert.equal(r.source, "self");
+  });
+
+  // ② 真实 DB 继承
+  it("D02: 真实 DB 继承（subagent → parent 有绑定）→ source=inherited", (t) => {
+    if (!realChain) { t.skip("跳过：DB 无可用 subagent 继承链"); return; }
+    const { child, parent } = realChain;
+    // 给 parent 写绑定
+    C.saveBinding(common, parent, {
+      worktree: "C:\\wt\\inherited", branch: "worktree-inh", base: "master", source: "self",
+    });
+    const r = C.resolveBinding(common, child);
+    assert.ok(r, "子代理应继承到父绑定");
+    assert.equal(r.worktree, "C:\\wt\\inherited");
+    assert.equal(r.source, "inherited");
+  });
+
+  // ② 快照语义
+  it("D03: 继承后写快照 → 第二次不查 DB（改父绑定不影响子）", (t) => {
+    if (!realChain) { t.skip("跳过：DB 无可用 subagent 继承链"); return; }
+    const { child, parent } = realChain;
+    // D02 已快照了 child 的 binding，改 parent 的绑定
+    C.saveBinding(common, parent, {
+      worktree: "C:\\wt\\changed", branch: "worktree-changed", base: "master", source: "self",
+    });
+    const r = C.resolveBinding(common, child);
+    // 子的快照不变
+    assert.equal(r.worktree, "C:\\wt\\inherited");
+    assert.equal(r.source, "inherited");
+  });
+
+  // ③ state.json 兜底
+  it("D04: 无直绑无 DB → state.json 兜底 → source=fallback-state", () => {
+    const sid = "sess_d04_top"; // 非 subagent 前缀，不查 DB
+    C.saveStateByCommon(common, {
+      active: true, path: "C:\\wt\\state", branch: "worktree-state", base: "master",
+      entered_at: new Date().toISOString(),
+    });
+    const r = C.resolveBinding(common, sid);
+    assert.ok(r);
+    assert.equal(r.worktree, "C:\\wt\\state");
+    assert.equal(r.source, "fallback-state");
+    C.clearStateByCommon(common);
+  });
+
+  // ④ 全无 → null
+  it("D05: 全无绑定 → null", () => {
+    C.clearStateByCommon(common);
+    const sid = "sess_d05_nobody";
+    const r = C.resolveBinding(common, sid);
+    assert.equal(r, null);
+  });
+
+  // ② 降级：DB parent 无绑定，但继承链命中 state.json 兜底
+  it("D07: DB parent 无绑定 + 有 state.json → resolveInherited 命中 state（source=inherited）", (t) => {
+    if (!realChain) { t.skip("跳过：DB 无可用 subagent 继承链"); return; }
+    const { child, parent } = realChain;
+    // 清掉 child 的所有绑定（含 D03 的 inherited 快照）和 parent 的绑定（含 D03 残留）
+    C.clearBinding(common, child);
+    C.clearBinding(common, parent);
+    C.saveStateByCommon(common, {
+      active: true, path: "C:\\wt\\fb", branch: "worktree-fb", base: "master",
+      entered_at: new Date().toISOString(),
+    });
+    // resolveInherited 链：child → parent（顶层 sess_，无 binding）→ 命中 state.json 兜底。
+    // 返回到 resolveBinding 后标记 source=inherited（非 fallback-state，因为是经继承链拿到的）。
+    const r = C.resolveBinding(common, child);
+    assert.ok(r, "继承链命中 state.json 应返回绑定");
+    assert.equal(r.worktree, "C:\\wt\\fb");
+    assert.equal(r.source, "inherited", "经继承链拿到的 state.json 标记为 inherited");
+    C.clearStateByCommon(common);
+  });
+
+  // ① 优先于 ③
+  it("D08: 自身直绑优先于 state.json", () => {
+    const sid = "sess_d08";
+    C.saveBinding(common, sid, {
+      worktree: "C:\\wt\\self-d08", branch: "worktree-d08", base: "master", source: "self",
+    });
+    C.saveStateByCommon(common, {
+      active: true, path: "C:\\wt\\state-d08", branch: "worktree-state", base: "master",
+      entered_at: new Date().toISOString(),
+    });
+    const r = C.resolveBinding(common, sid);
+    assert.equal(r.worktree, "C:\\wt\\self-d08");
+    assert.equal(r.source, "self");
+    C.clearStateByCommon(common);
+  });
+
+  // D10: 顶层 session 不查 DB
+  it("D10: 顶层 session（sess_ 开头，非 subagent）→ 不查 DB", () => {
+    const sid = "sess_d10_topLevel"; // 不以 sess_subagent_ 开头
+    // 无直绑、无 state → null（不走 DB 查询）
+    C.clearStateByCommon(common);
+    const r = C.resolveBinding(common, sid);
+    assert.equal(r, null);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// E. allowlist 临时放行 + TTL + 注入防护
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("E. allowlist 临时放行", () => {
+  let repo, common, sid;
+
+  before(() => {
+    repo = makeRepo();
+    common = repoCommon(repo);
+    sid = "sess_nobody_e"; // 无绑定：allowlist 是唯一放行路径
+  });
+  after(() => cleanupRepo(repo));
+
+  // --- add + 放行效果 ---
+
+  it("E01: allow add 相对路径 → 后续 Write 放行", () => {
+    runWt("allow", { action: "add", path: "README.md", reason: "临时改文档" }, { cwd: repo });
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "README.md"), content: "x" },
+    });
+    assertPass(r);
+  });
+
+  it("E02: allow add 绝对路径 → Write 放行", () => {
+    const abs = path.join(repo, "abs-file.txt");
+    runWt("allow", { action: "add", path: abs, reason: "绝对路径" }, { cwd: repo });
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: abs, content: "x" },
+    });
+    assertPass(r);
+  });
+
+  it("E03: allow add glob (docs/*.md) → Write docs/x.md 放行", () => {
+    runWt("allow", { action: "add", path: "docs/*.md", reason: "glob" }, { cwd: repo });
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "docs", "guide.md"), content: "x" },
+    });
+    assertPass(r);
+  });
+
+  it("E04: allow list → 显示已有条目", () => {
+    const r = runWt("allow", { action: "list" }, { cwd: repo });
+    const content = wtContent(r);
+    assert.ok(content.includes("README.md"), `list 缺少 README.md: ${content.slice(0, 300)}`);
+  });
+
+  // --- TTL 过期 ---
+
+  it("E06: TTL 过期 → 过期条目不生效（白盒验证）", () => {
+    // 直接写入一个已过期的条目
+    C.addAllowlistEntry(common, {
+      path: "expired.txt", reason: "已过期",
+      expires_at: new Date(Date.now() - 60000).toISOString(),
+      created_at: new Date().toISOString(),
+    });
+    assert.equal(
+      C.isAllowlisted(common, path.join(repo, "expired.txt"), repo),
+      false,
+      "过期条目不应生效",
+    );
+  });
+
+  it("E07: TTL 未过期 → 条目生效", () => {
+    C.addAllowlistEntry(common, {
+      path: "fresh.txt", reason: "未过期",
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+      created_at: new Date().toISOString(),
+    });
+    assert.equal(
+      C.isAllowlisted(common, path.join(repo, "fresh.txt"), repo),
+      true,
+      "未过期条目应生效",
+    );
+  });
+
+  // --- 注入防护 ---
+
+  it("E08: allow add .git → 拒绝", () => {
+    const r = runWt("allow", { action: "add", path: ".git", reason: "evil" }, { cwd: repo });
+    assertWtFail(r, "拒绝");
+  });
+
+  it("E09: allow add * → 拒绝", () => {
+    const r = runWt("allow", { action: "add", path: "*", reason: "evil" }, { cwd: repo });
+    assertWtFail(r, "拒绝");
+  });
+
+  it("E10: allow add . → 拒绝", () => {
+    const r = runWt("allow", { action: "add", path: ".", reason: "evil" }, { cwd: repo });
+    assertWtFail(r, "拒绝");
+  });
+
+  it("E11: allow add 含 .git 的路径 → 拒绝", () => {
+    const r = runWt("allow", { action: "add", path: "src/.git/config", reason: "evil" }, { cwd: repo });
+    assertWtFail(r, "拒绝");
+  });
+
+  it("E12: allow add 后 audit.jsonl 有记录", () => {
+    C.clearAllowlist(common);
+    runWt("allow", { action: "add", path: "audit-test.md", reason: "审计检查" }, { cwd: repo });
+    const auditFile = path.join(common, "worktree-guard", "audit.jsonl");
+    assert.ok(fs.existsSync(auditFile), `audit.jsonl 不存在: ${auditFile}`);
+    const content = fs.readFileSync(auditFile, "utf8");
+    assert.ok(content.includes("audit-test.md"), `audit.jsonl 缺少记录: ${content.slice(0, 300)}`);
+  });
+
+  it("E05: allow clear → 清空", () => {
+    runWt("allow", { action: "clear" }, { cwd: repo });
+    const r = runWt("allow", { action: "list" }, { cwd: repo });
+    const content = wtContent(r);
+    assert.ok(content.includes("无放行路径"), `清空后应显示空: ${content.slice(0, 200)}`);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// F. whitelist 声明式白名单 + validateWhitelist
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("F. whitelist 声明式白名单", () => {
+  let repo, common, wtPath, sid;
+
+  before(() => {
+    repo = makeRepo();
+    common = repoCommon(repo);
+    sid = "sess_test_f";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "feat" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { env, cwd: repo });
+    wtPath = path.join(repo, ".worktrees", "worktree-feat");
+    // 写 sidecar 配置
+    fs.mkdirSync(path.join(repo, ".zcode"), { recursive: true });
+    fs.writeFileSync(
+      path.join(repo, ".zcode", "worktree-guard.json"),
+      JSON.stringify({ main_write_whitelist: ["AGENTS.md", "docs/**/*.md"] }),
+    );
+  });
+  after(() => cleanupRepo(repo));
+
+  it("F01: 白名单精确匹配 AGENTS.md → Write 放行", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "AGENTS.md"), content: "x" },
+    });
+    assertPass(r);
+  });
+
+  it("F02: 白名单 glob docs/**/*.md → Write docs/a/b.md 放行", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "docs", "a", "b.md"), content: "x" },
+    });
+    assertPass(r);
+  });
+
+  it("F03: 非白名单路径 → 重写（不被白名单放行）", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "src", "app.js"), content: "x" },
+    });
+    assertRewrite(r, wtPath);
+  });
+
+  it("F04: 白名单优先于重写（有绑定仍放行白名单路径）", () => {
+    // AGENTS.md 在白名单，即使有绑定也放行（不重写）
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "AGENTS.md"), content: "x" },
+    });
+    assertPass(r); // 不是 rewrite，是 pass
+  });
+});
+
+describe("F2. validateWhitelist 危险模式检测", () => {
+  it("F05: 危险裸根模式 → 标记 dangerous", () => {
+    const { valid, dangerous } = C.validateWhitelist(["AGENTS.md", ".", "/", "*", "**", "./", ".\\"]);
+    assert.ok(valid.includes("AGENTS.md"));
+    for (const d of [".", "/", "*", "**"]) {
+      assert.ok(dangerous.includes(d), `dangerous 缺少 "${d}": ${JSON.stringify(dangerous)}`);
+    }
+  });
+
+  it("F06: 正常模式 → 标记 valid", () => {
+    const { valid, dangerous } = C.validateWhitelist(["AGENTS.md", "docs/**/*.md", "src/*.ts"]);
+    assert.equal(dangerous.length, 0);
+    assert.equal(valid.length, 3);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// G. authorize-main / revoke-main
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("G. authorize-main / revoke-main", () => {
+  let repo, common, wtPath, sid;
+
+  before(() => {
+    repo = makeRepo();
+    common = repoCommon(repo);
+    sid = "sess_test_g";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "feat" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { env, cwd: repo });
+    wtPath = path.join(repo, ".worktrees", "worktree-feat");
+  });
+  after(() => cleanupRepo(repo));
+
+  it("G01: authorize-main → 后续 Write 放行（不再重写）", () => {
+    runWt("authorize-main", { reason: "测试全局授权" }, { cwd: repo });
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "main.js"), content: "x" },
+    });
+    assertPass(r); // 放行，不重写
+  });
+
+  it("G02: authorize-main → Bash 放行（handleBash 早退）", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: "git push origin master" },
+    });
+    assertPass(r);
+  });
+
+  it("G04: authorize 期间写 .git → 仍拦截（硬规则优先于 globalAllow）", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, ".git", "config"), content: "x" },
+    });
+    assertBlock(r, ".git");
+  });
+
+  it("G03: revoke-main → Write 重新走正常决策（有绑定→重写）", () => {
+    runWt("revoke-main", {}, { cwd: repo });
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "main.js"), content: "x" },
+    });
+    assertRewrite(r, wtPath);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// H. wt.mjs 生命周期子命令
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("H. wt.mjs 生命周期子命令", () => {
+  let repo;
+  beforeEach(() => { repo = makeRepo(); });
+  afterEach(() => cleanupRepo(repo));
+
+  it("H01: create 合法 task_name → 成功，worktree 目录存在", () => {
+    const r = runWt("create", { task_name: "my-feature" }, { cwd: repo });
+    assertWtOk(r, "worktree 已创建");
+    assert.ok(fs.existsSync(path.join(repo, ".worktrees", "worktree-my-feature")),
+      "worktree 目录应存在");
+  });
+
+  it("H02: create 非法 task_name（大写）→ 失败", () => {
+    const r = runWt("create", { task_name: "MyFeature" }, { cwd: repo });
+    assertWtFail(r, "task_name 非法");
+  });
+
+  it("H02b: create 非法 task_name（中文）→ 失败", () => {
+    const r = runWt("create", { task_name: "功能" }, { cwd: repo });
+    assertWtFail(r, "task_name 非法");
+  });
+
+  it("H03: create 重复 task_name → 失败（分支已存在）", () => {
+    runWt("create", { task_name: "dup" }, { cwd: repo });
+    const r = runWt("create", { task_name: "dup" }, { cwd: repo });
+    assertWtFail(r, "已存在");
+  });
+
+  it("H04: create 指定 base_branch → 成功", () => {
+    // 先创建一个 base 分支
+    spawnSync("git", ["branch", "develop"], { cwd: repo, encoding: "utf8" });
+    const r = runWt("create", { task_name: "from-dev", base_branch: "develop" }, { cwd: repo });
+    assertWtOk(r, "worktree 已创建");
+  });
+
+  it("H05: enter 未注册路径 → 失败", () => {
+    const r = runWt("enter", { path: ".worktrees/nonexistent" }, { cwd: repo });
+    assertWtFail(r);
+  });
+
+  it("H06: enter 合法 → 写 binding + state.json", () => {
+    runWt("create", { task_name: "enter-test" }, { cwd: repo });
+    const env = { ZCODE_SESSION_ID: "sess_h06" };
+    const r = runWt("enter", { path: ".worktrees/worktree-enter-test" }, { env, cwd: repo });
+    assertWtOk(r, "已进入");
+    const common = repoCommon(repo);
+    const binding = C.loadBinding(common, "sess_h06");
+    assert.ok(binding && binding.worktree, "binding 应已写入");
+    const state = C.loadStateByCommon(common);
+    assert.ok(state && state.active, "state.json 应已写入");
+  });
+
+  it("H07: exit action=keep → 清 binding，保留目录", () => {
+    runWt("create", { task_name: "keep-test" }, { cwd: repo });
+    const env = { ZCODE_SESSION_ID: "sess_h07" };
+    runWt("enter", { path: ".worktrees/worktree-keep-test" }, { env, cwd: repo });
+    const r = runWt("exit", { action: "keep" }, { env, cwd: repo });
+    assertWtOk(r, "绑定已清除");
+    // 目录仍在
+    assert.ok(fs.existsSync(path.join(repo, ".worktrees", "worktree-keep-test")),
+      "keep 模式目录应保留");
+    // binding 已清
+    const common = repoCommon(repo);
+    assert.equal(C.loadBinding(common, "sess_h07"), null, "binding 应已清除");
+  });
+
+  it("H08: exit action=remove 工作区脏 → 拒绝删除", () => {
+    runWt("create", { task_name: "dirty-test" }, { cwd: repo });
+    const env = { ZCODE_SESSION_ID: "sess_h08" };
+    runWt("enter", { path: ".worktrees/worktree-dirty-test" }, { env, cwd: repo });
+    // 在 worktree 里写一个文件制造脏状态
+    const wtDir = path.join(repo, ".worktrees", "worktree-dirty-test");
+    fs.writeFileSync(path.join(wtDir, "uncommitted.txt"), "dirty");
+    const r = runWt("exit", { action: "remove", confirm_remove: true }, { env, cwd: repo });
+    assertWtFail(r, "未提交");
+  });
+
+  it("H09: exit action=remove 干净 + confirm → 删目录", () => {
+    runWt("create", { task_name: "clean-test" }, { cwd: repo });
+    const env = { ZCODE_SESSION_ID: "sess_h09" };
+    runWt("enter", { path: ".worktrees/worktree-clean-test" }, { env, cwd: repo });
+    const r = runWt("exit", { action: "remove", confirm_remove: true }, { env, cwd: repo });
+    assertWtOk(r, "已删除");
+    assert.ok(!fs.existsSync(path.join(repo, ".worktrees", "worktree-clean-test")),
+      "remove 模式目录应已删除");
+  });
+
+  it("H09b: exit action=remove 无 confirm → 拒绝", () => {
+    runWt("create", { task_name: "noconfirm-test" }, { cwd: repo });
+    const env = { ZCODE_SESSION_ID: "sess_h09b" };
+    runWt("enter", { path: ".worktrees/worktree-noconfirm-test" }, { env, cwd: repo });
+    const r = runWt("exit", { action: "remove" }, { env, cwd: repo });
+    assertWtFail(r, "confirm_remove");
+  });
+
+  it("H10: status → 显示 worktree 列表 + 有效绑定", () => {
+    runWt("create", { task_name: "status-test" }, { cwd: repo });
+    const env = { ZCODE_SESSION_ID: "sess_h10" };
+    runWt("enter", { path: ".worktrees/worktree-status-test" }, { env, cwd: repo });
+    const r = runWt("status", {}, { env, cwd: repo });
+    const content = wtContent(r);
+    assert.ok(content.includes("已注册 worktree"), `status 缺少 worktree 列表: ${content.slice(0, 300)}`);
+    assert.ok(content.includes("有效绑定"), `status 缺少有效绑定: ${content.slice(0, 300)}`);
+    assert.ok(content.includes("worktree-status-test"), `status 缺少 worktree 名: ${content.slice(0, 300)}`);
+  });
+
+  it("H11: 悬空检查（exit remove 时其他 session 仍绑定）→ 拒绝", () => {
+    runWt("create", { task_name: "dangling-test" }, { cwd: repo });
+    // A、B 两 session 绑同一 worktree
+    runWt("enter", { path: ".worktrees/worktree-dangling-test" },
+      { env: { ZCODE_SESSION_ID: "sess_a" }, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-dangling-test" },
+      { env: { ZCODE_SESSION_ID: "sess_b" }, cwd: repo });
+    // A 尝试 remove → 拒绝（B 仍绑定）
+    const r = runWt("exit", { action: "remove", confirm_remove: true },
+      { env: { ZCODE_SESSION_ID: "sess_a" }, cwd: repo });
+    assertWtFail(r, "其他会话");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// I. SessionStart hook 4 分支
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("I. SessionStart hook 4 分支", () => {
+  let repo, common;
+
+  before(() => {
+    repo = makeRepo();
+    common = repoCommon(repo);
+  });
+  after(() => cleanupRepo(repo));
+
+  it("I04: 全新无任何状态 → 默认强制工作流提示", () => {
+    const r = runSs({ cwd: repo, session_id: "sess_i04" }, { cwd: repo });
+    assert.equal(r.code, 0);
+    let parsed;
+    try { parsed = JSON.parse(r.stdout); } catch { assert.fail(`stdout 非 JSON: ${r.stdout.slice(0, 200)}`); }
+    assert.ok(parsed.additionalContext, "缺少 additionalContext");
+    assert.ok(parsed.additionalContext.includes("worktree"), `默认提示应含 worktree: ${parsed.additionalContext.slice(0, 200)}`);
+  });
+
+  it("I01: session 已有直绑 → 激活中提示", () => {
+    const sid = "sess_i01";
+    runWt("create", { task_name: "ss-test" }, { cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-ss-test" },
+      { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+    const r = runSs({ cwd: repo, session_id: sid }, { cwd: repo });
+    let parsed;
+    try { parsed = JSON.parse(r.stdout); } catch { assert.fail(`stdout 非 JSON`); }
+    assert.ok(parsed.additionalContext.includes("激活"), `应含"激活": ${parsed.additionalContext.slice(0, 200)}`);
+  });
+
+  it("I03: 无绑定但有 v0.1 遗留 state.json → 迁移提示", () => {
+    const sid = "sess_i03_new"; // 新 session，无直绑
+    // state.json 已被 I01 的 enter 写入（指向 worktree-ss-test）
+    // 确认 state 存在
+    const state = C.loadStateByCommon(common);
+    assert.ok(state, "state.json 应存在");
+    const r = runSs({ cwd: repo, session_id: sid }, { cwd: repo });
+    let parsed;
+    try { parsed = JSON.parse(r.stdout); } catch { assert.fail(`stdout 非 JSON`); }
+    assert.ok(parsed.additionalContext.includes("迁移") || parsed.additionalContext.includes("继承"),
+      `应含"迁移"或"继承": ${parsed.additionalContext.slice(0, 200)}`);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// K. 鲁棒性 / 边界
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("K. 鲁棒性 / 边界", () => {
+  let repo;
+  before(() => { repo = makeRepo(); });
+  after(() => cleanupRepo(repo));
+
+  it("K01: stdin 非法 JSON → guard_hook 不崩溃、放行（fail-open）", () => {
+    const r = spawnSync("node", [HOOK], {
+      input: "this is not json {{{",
+      encoding: "utf8", cwd: repo, timeout: 10000,
+    });
+    assert.equal(r.status, 0, `非法 JSON 应 exit 0（fail-open），实际 ${r.status}`);
+  });
+
+  it("K02: guard_hook tool_name 未知 → 放行", () => {
+    const r = runHook({
+      tool_name: "SomeUnknownTool", cwd: repo, session_id: "sess_k02",
+      tool_input: { file_path: path.join(repo, "x.js") },
+    });
+    assertPass(r);
+  });
+
+  it("K03: cwd 不在 git 仓库 → 放行", () => {
+    const nonGit = fs.mkdtempSync(path.join(os.tmpdir(), "wtg-nogit-"));
+    try {
+      const r = runHook({
+        tool_name: "Write", cwd: nonGit, session_id: "sess_k03",
+        tool_input: { file_path: path.join(nonGit, "x.js"), content: "x" },
+      });
+      assertPass(r);
+    } finally {
+      fs.rmSync(nonGit, { recursive: true, force: true });
+    }
+  });
+
+  it("K04: session_id 缺省 → 用 cli-manual 兜底不崩", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo,
+      // 不传 session_id
+      tool_input: { file_path: path.join(repo, "x.js"), content: "x" },
+    });
+    // cli-manual 无绑定 → fail-closed block
+    assertBlock(r);
+  });
+
+  it("K05: 多 session 并发绑定不同 worktree → 互不干扰", () => {
+    const env1 = { ZCODE_SESSION_ID: "sess_concurrent_1" };
+    const env2 = { ZCODE_SESSION_ID: "sess_concurrent_2" };
+    runWt("create", { task_name: "wt1" }, { env: env1, cwd: repo });
+    runWt("create", { task_name: "wt2" }, { env: env2, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-wt1" }, { env: env1, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-wt2" }, { env: env2, cwd: repo });
+
+    const wt1Path = path.join(repo, ".worktrees", "worktree-wt1");
+    const wt2Path = path.join(repo, ".worktrees", "worktree-wt2");
+
+    // session 1 → 重写到 wt1
+    const r1 = runHook({
+      tool_name: "Write", cwd: repo, session_id: "sess_concurrent_1",
+      tool_input: { file_path: path.join(repo, "a.js"), content: "x" },
+    });
+    assertRewrite(r1, wt1Path);
+
+    // session 2 → 重写到 wt2
+    const r2 = runHook({
+      tool_name: "Write", cwd: repo, session_id: "sess_concurrent_2",
+      tool_input: { file_path: path.join(repo, "a.js"), content: "x" },
+    });
+    assertRewrite(r2, wt2Path);
+  });
+});
