@@ -3,6 +3,14 @@
 > **生成日期**: 2026-08-10
 > **状态**: v0.1 实现完成，待端到端验证
 
+> **更新（v0.4，2026-08-11）**：哲学从"强制 worktree"改为"**默认主副本开放，按需隔离**"。
+> 本文档下方描述的是 v0.1 的原始设计（强制模型）。相对 v0.1 的行为差异：
+> - 无绑定时 Write/Edit/Read 主 checkout 从 🔴拦截 → ✅放行（默认开放）；
+> - 无绑定时本地 `git merge/rebase/pull/checkout` 放行（push 到 master/main 仍拦截）；
+> - 绑定只来自本会话 `enter`（+ subagent 继承父链）；`state.json` 不再作为绑定真值；
+> - 跨副本写入、写 `.git`、push 到 master/main、删 worktree 分支——始终拦截（安全网）。
+> 下方的决策表与目标表述保留为 v0.1 历史；以 README 与 SKILL.md 为准。
+
 ## 1. 目标
 
 为 ZCode 构建一个 worktree 强制插件，解决 agent 在 worktree 模式下的两大痛点：

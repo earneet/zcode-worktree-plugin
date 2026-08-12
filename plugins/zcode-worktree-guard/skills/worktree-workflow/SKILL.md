@@ -1,11 +1,24 @@
 ---
 name: worktree-workflow
-description: 强制 git worktree 工作流。所有开发在隔离 worktree 副本进行；PreToolUse hook 透明重写路径，合并回主分支需用户明确授权。当用户在任何 git 仓库请求代码修改、功能开发、重构、bug 修复时，先按本流程进入 worktree 副本；也用于查询 worktree 状态或退出副本。
+description: 可选的 git worktree 隔离工作流。默认在主 checkout 自由工作（不拦截、不重写）；当用户想隔离一个任务到独立分支副本时，create + enter 后本会话的写路径会自动透明重写到该副本，合并回主分支需用户明确授权。用于进入/退出 worktree 副本、查询状态。
 ---
 
-# 强制 git worktree 工作流
+# 可选的 git worktree 隔离工作流
 
-## 路径约定（重要）
+## 默认工作方式（重要）
+
+**默认在主 checkout 自由工作。** 没有明确 `enter` 一个 worktree 之前：
+- 你对主 checkout 的 `Write` / `Edit` / `Read`、以及本地 `git` 操作（merge / rebase / pull / checkout 等）**一律放行，不重写、不拦截**——这就是正常的主仓库工作流。
+- 唯二的常驻安全网：`git push` 到 `master`/`main` 始终需用户授权；删除 `worktree-*` 分支始终需授权。
+
+**一旦你 `enter` 一个 worktree（本会话绑定），本会话才进入"锁定到副本"模式：**
+- 写主 checkout 的路径会被**透明重写**到该副本；
+- 跨副本写入、副本内 `git checkout master/main`、受保护分支上的 `merge/rebase/pull` 被拦截；
+- `git push` 到 master/main、删 worktree 分支仍需授权。
+
+绑定只来自**本会话**的 `enter`（或子代理经父会话继承）。上个会话的 `enter` 不会自动延续到新会话。
+
+## 路径约定
 
 本技能引用的脚本位于本 skill 的 base directory 往上两级的 `scripts/` 目录。即脚本路径是：
 
@@ -20,18 +33,18 @@ description: 强制 git worktree 工作流。所有开发在隔离 worktree 副�
 ls "<base>/../../scripts/wt.mjs"   # 应输出该文件路径
 ```
 
-## 核心纪律
+## 核心纪律（enter 之后）
 
-- **所有开发任务必须在隔离的 git worktree 分支副本中进行**（分支名 `worktree-<task>`）；
-- **一般修改禁止在主 checkout（任何分支）进行**；
+- `enter` 之后，本会话的文件改动透明重写到绑定的 worktree 副本（分支名 `worktree-<task>`）；
 - 合并回主分支（master/main）必须等待用户明确授权；
-- 在 worktree 副本内禁止 `git checkout/switch` 到 master/main。
+- 在 worktree 副本内禁止 `git checkout/switch` 到 master/main；
+- 退出副本（`exit`）即回到默认开放模式。
 
-## 透明重写机制（本插件核心特性）
+## 透明重写机制（enter 之后的核心特性）
 
-**进入 worktree 后，你无需手动修改文件路径。** PreToolUse hook 会自动：
+**`enter` 之后，你无需手动修改文件路径。** PreToolUse hook 会自动：
 - 把你 `Write` / `Edit` / `Read` 的 `file_path`、`Glob` / `Grep` 的 `path` 从主 checkout 根
-  **透明重写**到活动 worktree 目录。你写 `src/app.js`，实际落到 worktree 里。
+  **透明重写**到绑定的 worktree 目录。你写 `src/app.js`，实际落到 worktree 里。
 - 工具返回值会显示重写后的真实路径——这是正常的，文件确实落在了 worktree。
 
 所以：**照常写主 checkout 的路径即可，hook 替你重定向。** 这正是"无路径漂移"的保证。
@@ -79,36 +92,39 @@ echo '{"reason": "用户授权合并 worktree-add-drop-module"}' | node "<WT>" a
 # 撤销授权（授权操作完成后立即执行）
 echo '{}' | node "<WT>" revoke-main
 
-# v0.2 会话级临时放行（写主目录某文件，不经过 worktree）
+# 会话级临时放行（仅在已 enter 副本时，想例外写主目录某文件）
 echo '{"action": "add", "path": "README.md", "reason": "临时改文档"}' | node "<WT>" allow
 echo '{"action": "list"}' | node "<WT>" allow     # 查看当前会话放行列表
 echo '{"action": "clear"}' | node "<WT>" allow    # 清空放行
 ```
 
-## 何时用 allow（逃生口）
+## 何时用 allow / 白名单（仅在已 enter 副本时才需要）
 
-正常情况下，所有代码改动都应进 worktree（透明重写会自动处理）。**仅当**你需要写
-仓库级配置/文档（如 AGENTS.md、CI 配置）到主 checkout 时，才用逃生口：
+**默认（未 enter）写主 checkout 本来就放行，不需要 allow。** 只有当你已经 `enter` 了一个
+worktree、又想例外写主 checkout 某路径（绕过重写），才用逃生口：
 
 - **白名单（永久、声明式）**：在 `<repo>/.zcode/worktree-guard.json` 配置
-  `"main_write_whitelist": ["AGENTS.md", "docs/**/*.md"]`。这些路径永远写主目录。
+  `"main_write_whitelist": ["AGENTS.md", "docs/**/*.md"]`。这些路径即使 enter 后也写主目录。
 - **allow 子命令（临时、本次会话）**：上面示例，放行 60 分钟（可配 `ttl_minutes`）。
   拒绝放行 `.git`、仓库根、`*` 等危险路径（注入防护）。每次调用记审计日志。
 
 ## 开发任务标准流程
 
-1. **任务开始时**：先跑 `status` 查看是否有活动 worktree。
-   - 已有活动副本 → 继续在该副本工作（路径重写已生效，照常写主 checkout 路径）。
-   - 没有 → `create` 创建新副本。
+**默认在主 checkout 自由工作——不需要任何前置操作。** 只有当用户明确想隔离任务到 worktree
+（或你判断任务适合隔离）时，才走下面的 enter 流程：
 
-2. **创建副本后**：必须 `enter` 登记为活动副本，路径透明重写才生效。
+1. **任务开始时**：先跑 `status` 查看当前会话是否已绑定 worktree。
+   - 已绑定 → 继续在该副本工作（路径重写已生效，照常写主 checkout 路径）。
+   - 未绑定、且想隔离 → `create` 创建新副本，然后 `enter`。
+
+2. **创建副本后**：`enter` 登记为本会话绑定，路径透明重写才生效。
 
 3. **在副本内工作**：
    - **直接用 Write/Edit 写主 checkout 的路径即可**，hook 自动重写到 worktree；
    - 不要主动加 worktree 前缀，也不要 cd 进 worktree——保持路径自然，hook 处理一切。
 
 4. **任务结束时**：`exit(action="keep")` 汇报状态，**等待用户授权合并**。
-   - 不要自行 `git merge` / `git rebase` 到主分支（会被 hook 拦截）。
+   - 不要自行 `git merge` / `git rebase` 到主分支（绑定态会被 hook 拦截）。
    - 报告口径：`worktree <name> 已就绪，待您确认是否合并`。
 
 5. **合并 worktree 到主分支**（用户明确说"合并"后）：
@@ -120,25 +136,28 @@ echo '{"action": "clear"}' | node "<WT>" allow    # 清空放行
      authorize 的授权还没生效，merge 就会被拦截。分三次调用确保授权先落盘、再放行操作。
    - 合并经用户确认后，才可 `exit(action="remove")` 清理副本目录（分支保留）。
 
-6. **极少数直改主 checkout 的情况**（如改仓库级文档）：
-   - 同样分步：先 `authorize-main` → 再用 Write/Edit 修改 → 最后 `revoke-main`。
+6. **不进 worktree、直接改主 checkout**（最常见情况）：
+   - 默认就是允许的，直接用 Write/Edit/git 操作即可，无需任何授权。
+   - `git push` 到 master/main 仍需 `authorize-main` → push → `revoke-main`（安全网）。
 
 ## 拦截规则一览
 
 | 场景 | 结果 |
 |---|---|
-| 有活动副本，写主 checkout 路径 | ✅ **自动重写**到 worktree（你无感知） |
-| 有活动副本，写副本内路径 | ✅ 放行 |
-| 有活动副本，Glob/Grep 无 path | ✅ 自动注入 path=worktree |
-| 有活动副本，写其他副本 | 🔴 拦截 |
-| 写 `.git` 路径 | 🔴 拦截（保护 git 元数据） |
-| 无活动副本，Write/Edit 主 checkout | 🔴 拦截（写保护） |
-| 无活动副本，Read 主 checkout | ✅ 放行（只读不拦） |
-| master/main 上 `git merge/rebase/pull` | 🔴 拦截（需授权） |
-| 副本内 `git checkout master/main`、删 `worktree-*` 分支 | 🔴 拦截 |
+| 未 enter，Write/Edit/Read 主 checkout | ✅ 放行（默认开放，不重写不拦截） |
+| 未 enter，本地 `git merge/rebase/pull/checkout` | ✅ 放行 |
+| 未 enter，`git push` 到 master/main | 🔴 拦截（安全网，需授权） |
+| 有绑定，写主 checkout 路径 | ✅ **自动重写**到 worktree（你无感知） |
+| 有绑定，写副本内路径 | ✅ 放行 |
+| 有绑定，Glob/Grep 无 path | ✅ 自动注入 path=worktree |
+| 有绑定/在副本内，写其他副本 | 🔴 拦截（跨副本保护） |
+| 未 enter 或有绑定，写其他副本 | 🔴 拦截（跨副本保护，始终生效） |
+| 写 `.git` 路径 | 🔴 拦截（保护 git 元数据，硬规则） |
+| 有绑定/在副本内，受保护分支上 `git merge/rebase/pull` | 🔴 拦截（需授权） |
+| 有绑定/在副本内，`git checkout master/main`、删 `worktree-*` 分支 | 🔴 拦截 |
 | 任何位置 `git push` 到 master/main | 🔴 拦截（需授权） |
 | 副本内 `git merge master`（同步基线） | ✅ 放行 |
-| `authorize-main` 授权期间 | ✅ 全部放行 |
+| `authorize-main` 授权期间 | ✅ 全部放行（`.git` 仍拦） |
 | 仓库外路径、非 git 目录 | ✅ 放行 |
 
 已知边界：hook 是 fail-open（脚本异常放行）；Bash 工作目录无法被重写，只拦危险 git 操作。
@@ -147,10 +166,10 @@ echo '{"action": "clear"}' | node "<WT>" allow    # 清空放行
 
 | 操作 | 允许位置 | 是否需要用户明确授权 |
 |---|---|---|
-| 写代码/改文件 | 活动 worktree 副本（路径自动重写） | 否（但必须先进副本） |
-| 改仓库级文档/配置 | 主 checkout | 是 |
+| 写代码/改文件（默认） | 主 checkout 或 enter 后的 worktree 副本 | 否 |
+| enter 后改主 checkout | 自动重写到副本（或用 allow/whitelist 例外） | 否 |
+| `git push` → master/main | 主 checkout | 是 |
 | `git merge worktree-xxx` → 主分支 | 主 checkout | 是 |
 | `git merge master` → 副本 | worktree 副本 | 否（同步基线） |
-| `git push` → master/main | 主 checkout | 是 |
 | `git checkout master/main` | worktree 副本内禁止 | 是 |
 | 删除 worktree 分支 | 任何位置 | 是 |

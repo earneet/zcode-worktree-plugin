@@ -1,6 +1,8 @@
 // zcode-worktree-guard 共享工具：git 封装、路径归一化、状态读写、绑定解析、决策表。
 // wt.mjs 与 guard_hook.mjs 共用本模块。纯 Node 标准库，零依赖。
-// v0.2：会话级绑定（bindings/ 每session一文件）+ DB parent 继承 + state.json 兜底。
+// v0.2：会话级绑定（bindings/ 每session一文件）+ DB parent 继承。
+// v0.4：默认主副本开放——绑定只来自本会话 enter（或 subagent 继承父链 enter），
+//       state.json 不再作为绑定真值（仅保留 globalAllow / 审计 / 状态显示）。
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs";
@@ -251,8 +253,10 @@ function safeFileName(s) { return s.replace(/[^a-zA-Z0-9._-]/g, "-"); }
 export function nowIso() { return new Date().toISOString(); }
 
 // ---------------------------------------------------------------------------
-// v0.1 兜底层：state.json（仓库级单活动，跨 session 共享）
-// 保留作为 resolveBinding 的最终降级真值源。
+// state.json（仓库级单活动，跨 session 共享）
+// v0.4 起不再作为绑定真值（默认开放语义下绑定只来自本会话明确 enter）。
+// 仍保留：enter/exit 写入它作为"最近一次活动 worktree"的记录，供 status 显示与
+// globalAllow（authorize-main）承载；resolveBinding 不再读它。
 
 export function loadStateByCommon(common) {
   const s = readJson(stateFile(common));
@@ -503,11 +507,12 @@ export function queryParentId(sessionId) {
 }
 
 // ---------------------------------------------------------------------------
-// v0.2 绑定解析（核心）：三层降级
+// 绑定解析（核心）：默认主副本开放——绑定只来自本会话 enter（或 subagent 继承父链 enter）。
 //   ① bindings/<session_id>.json（自身直绑，最高优先）
-//   ② DB parent 链继承（查 parent_id，快照到自身）
-//   ③ state.json（v0.1 兜底，仓库级单活动）
-//   ④ 无绑定 → 返回 null（hook 层 fail-closed block 写）
+//   ② DB parent 链继承（仅 sess_subagent_*，查 parent_id，快照到自身）
+//   ③ 无绑定 → 返回 null（hook 层放行主副本写入，不拦截）
+// v0.4 起 state.json 不再作为绑定真值（默认开放语义下绑定必须由本会话明确 enter 产生），
+// 避免上个会话的 enter 跨会话残留、把新会话自动锁进副本。
 
 export function resolveBinding(common, sessionId) {
   // ① 自身直绑
@@ -526,18 +531,7 @@ export function resolveBinding(common, sessionId) {
     }
   }
 
-  // ③ state.json 兜底（v0.1 仓库级单活动）
-  const state = loadStateByCommon(common);
-  if (state) {
-    return {
-      worktree: state.path,
-      branch: state.branch,
-      base: state.base,
-      source: "fallback-state",
-    };
-  }
-
-  // ④ 无绑定
+  // ③ 无绑定 → null（hook 层放行主副本写入）
   return null;
 }
 
@@ -553,11 +547,7 @@ function resolveInherited(common, sessionId, depth = 0) {
   if (parentId.startsWith("sess_subagent_")) {
     return resolveInherited(common, parentId, depth + 1);
   }
-  // 父是顶层会话，查它的直绑没有 → 尝试 state.json 兜底
-  const state = loadStateByCommon(common);
-  if (state) {
-    return { worktree: state.path, branch: state.branch, base: state.base };
-  }
+  // 父是顶层会话且无直绑 → 不再降级到 state.json（v0.4：绑定只来自明确 enter）
   return null;
 }
 
