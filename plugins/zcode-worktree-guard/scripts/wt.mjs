@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// zcode-worktree-guard 生命周期脚本 v0.2
+// zcode-worktree-guard 生命周期脚本
 // create/enter/exit/status/authorize-main/revoke-main/allow
-// v0.2：session 级绑定（bindings/<session_id>.json）+ state.json 兜底 + 悬空检查
+// session 级绑定（bindings/<session_id>.json）+ subagent 继承 + 悬空检查。
+// v0.4：默认主副本开放——绑定只由本会话 enter 产生；state.json 仅记录最近活动 + 授权标记。
 import * as C from "./common.mjs";
 import path from "node:path";
 import fs from "node:fs";
@@ -116,7 +117,7 @@ async function cmdEnter(params, cwd) {
   const base = C.loadBasesByCommon(common)[branch] || "master";
   const sessionId = getSessionId();
 
-  // v0.2：写 session 级 binding + state.json 兜底
+  // 写 session 级 binding（绑定真值）+ state.json（仅记录最近活动，非绑定真值）
   const binding = { worktree: path.resolve(target.path), branch, base, source: "self" };
   C.saveBinding(common, sessionId, binding);
   C.saveStateByCommon(common, { active: true, path: binding.worktree, branch, base, entered_at: C.nowIso() });
@@ -139,6 +140,8 @@ async function cmdExit(params, cwd) {
   const sessionId = getSessionId();
   const binding = C.loadBinding(common, sessionId);
   const state = C.loadStateByCommon(common);
+  // exit 是显式清理命令：优先用本会话 binding；若 binding 缺失，回退到 state.json
+  // 记录的最近活动 worktree（便于清理/汇报），与 resolveBinding 语义无关。
   const active = binding || (state ? { worktree: state.path, branch: state.branch, base: state.base } : null);
   if (!active) return fail("当前会话没有活动 worktree。");
 
@@ -234,7 +237,11 @@ async function cmdStatus(params, cwd) {
 
   const state = C.loadStateByCommon(common);
   lines.push("");
-  lines.push(state ? `state.json 兜底: ${state.path} [${state.branch}]` : "state.json 兜底: 无");
+  lines.push(
+    state
+      ? `最近活动 worktree（仅记录，非绑定）: ${state.path} [${state.branch}]`
+      : "最近活动 worktree: 无"
+  );
   if (C.loadGlobalAllow(common)) lines.push("⚠️ 全局授权: 已启用（authorize-main）");
   ok(lines.join("\n"));
 }

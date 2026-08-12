@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // zcode-worktree-guard PreToolUse hook v0.2
-// 透明路径重写 + 拦截防御，基于决策表 + resolveBinding 三层降级。
-// fail-open（进程级异常放行）+ fail-closed（绑定解析失败则 block 写）。
+// 透明路径重写 + 拦截防御，基于决策表 + resolveBinding 绑定解析。
+// v0.4：默认主副本开放——无绑定时 Write/Edit/本地 git 操作放行（不拦截、不重写）；
+//       仅 enter 绑定后才启用透明重写与受保护分支拦截。fail-open（进程异常放行）。
+//       跨副本写入、`.git` 写、git push 到 master/main、删 worktree 分支——始终拦截。
 import * as C from "./common.mjs";
 import path from "node:path";
 import fs from "node:fs";
@@ -43,18 +45,37 @@ function block(reason, ctx) {
     `  活动 worktree: ${ctx.binding ? ctx.binding.worktree : "无"}\n` +
     `  目标/命令: ${target}\n\n` +
     `拦截原因: ${reason}\n\n` +
-    "修正方式:\n" +
-    "1. 普通开发任务 → 先 create + enter（之后写主 checkout 路径会自动重写到副本）；\n" +
-    "2. 需临时写主目录某文件 → echo '{\"action\":\"add\",\"path\":\"<相对路径>\",\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" allow；\n" +
-    "3. 用户明确授权全局 → echo '{\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" authorize-main；\n" +
-    `（脚本: node "${WT_TOOL}" <create|enter|exit|allow|authorize-main>，stdin 传 JSON）\n`
+    "修正方式（按需）:\n" +
+    "1. 写主 checkout 一般是允许的（默认开放）——若你正持有 enter 绑定又想写主副本，先 exit 退出该会话绑定；\n" +
+    "2. 跨副本/`.git` 写是硬拦截——确认目标路径正确；\n" +
+    "3. git push 到 master/main、删 worktree 分支需用户明确授权：echo '{\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" authorize-main；\n" +
+    "4. 需临时写主目录某文件（已绑定时）：echo '{\"action\":\"add\",\"path\":\"<相对路径>\",\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" allow；\n" +
+    `（脚本: node "${WT_TOOL}" <create|enter|exit|allow|authorize-main|revoke-main>，stdin 传 JSON）\n`
   );
   process.exit(2);
 }
 
 // ---------------------------------------------------------------------------
-// v0.2 决策表：Write/Edit/Read 的 file_path 判定（纯函数）
+// 决策表：Write/Edit/Read 的 file_path 判定（纯函数）
 // 返回 {action: "allow"|"deny"|"rewrite", reason, newTarget?, source?}
+// v0.4：默认主副本开放——无绑定写主 checkout 放行；跨副本写入始终拦截。
+
+// 跨副本写入保护：目标落在"另一个"已注册 worktree 副本内 → deny。
+// worktree 副本常在 root 内（默认 .worktrees/ 下），不检查会导致：
+//   - 无绑定时：写到别的副本（路径漂移）；
+//   - 有绑定时：被错误重写到自身副本（静默错位）。
+// 此检查无论有无绑定都生效。跳过主 checkout（path===root）与（有绑定时）自身副本。
+function crossWorktreeDeny(nTarget, ctx) {
+  const nRoot = C.norm(ctx.root);
+  const nWt = ctx.binding ? C.norm(ctx.binding.worktree) : null;
+  for (const wt of C.registeredWorktrees(ctx.root)) {
+    const nOther = C.norm(wt.path);
+    if (nOther === nRoot) continue; // 跳过主 checkout
+    if (nOther === nWt) continue;   // 跳过自身绑定的副本
+    if (C.isInside(nTarget, nOther)) return true;
+  }
+  return false;
+}
 
 function decideWrite(target, ctx, isWrite) {
   const nTarget = C.norm(target);
@@ -87,37 +108,27 @@ function decideWrite(target, ctx, isWrite) {
     return { action: "allow", source: "global-authorize" };
   }
 
-  // 6-8. 有绑定的情况
+  // 6. 跨副本写入保护（始终生效，不论有无绑定）
+  if (crossWorktreeDeny(nTarget, ctx)) {
+    return { action: "deny", reason: "目标路径在其他 worktree 副本内，不允许跨副本写入。" };
+  }
+
+  // 7. 有绑定：写副本内放行；写主 checkout 根下 → 透明重写
   if (binding && binding.worktree) {
     const nWt = C.norm(binding.worktree);
     if (C.isInside(nTarget, nWt)) {
-      return { action: "allow", source: "inside-worktree" }; // 6. 写副本内
+      return { action: "allow", source: "inside-worktree" };
     }
-    // 7. 目标在主 checkout 根下 → 透明重写（但要排除其他 worktree 副本）
-    if (C.isInside(nTarget, nRoot)) {
-      // 检查目标是否落在另一个已注册 worktree 副本内（跨副本写入）。
-      // worktree 副本常在 root 内（默认 .worktrees/ 下），不检查会被错误重写。
-      // 注意：registeredWorktrees 的第一个条目是主 checkout（path === root），需跳过。
-      for (const wt of C.registeredWorktrees(ctx.root)) {
-        const nOther = C.norm(wt.path);
-        if (nOther === nRoot) continue; // 跳过主 checkout（目标本来就该在 root 内）
-        if (nOther === nWt) continue;   // 跳过自身绑定的副本
-        if (C.isInside(nTarget, nOther)) {
-          return { action: "deny", reason: "目标路径在其他 worktree 副本内，不允许跨副本写入。" };
-        }
-      }
-      const rel = path.relative(nRoot, nTarget);
-      return { action: "rewrite", newTarget: path.join(binding.worktree, rel), source: "rewrite" };
-    }
-    // 8. root 外、副本外（理论不可达：§2 已放行 root 外）
-    return { action: "deny", reason: "目标在其他副本内，不允许跨副本写入。" };
+    // 目标在主 checkout 根下（已排除其他副本）→ 透明重写。
+    // 🔴 rel 必须用【原始大小写】的 root/target 计算，不能用 nRoot/nTarget（norm 小写过）——
+    // 否则文件名被小写，破坏大小写敏感的契约（如 Java 的 类名↔文件名）。norm 只用于上面的
+    // isInside 比对（大小写/分隔符不敏感的包含判断），不参与构造输出路径。
+    const rel = path.relative(ctx.root, target);
+    return { action: "rewrite", newTarget: path.join(binding.worktree, rel), source: "rewrite" };
   }
 
-  // 9. 无绑定（含 DB 失败降级到底）：Write/Edit fail-closed deny；Read allow
-  if (isWrite) {
-    return { action: "deny", reason: "当前会话无 worktree 绑定，写主 checkout 被禁止。先 create+enter，或用 allow/authorize-main 放行。" };
-  }
-  return { action: "allow", source: "read-no-binding" };
+  // 8. 无绑定：默认开放——主副本 Write/Edit/Read 全放行，不重写、不拦截
+  return { action: "allow", source: isWrite ? "unbound-main" : "read-unbound" };
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +166,8 @@ function handleSearchPathTool(toolInput, context) {
 
   if (C.isInside(nP, nWt)) return;
   if (!C.isInside(nP, nRoot)) return;
-  const rel = path.relative(nRoot, nP);
+  // 🔴 用原始大小写算 rel（同 decideWrite），避免搜索路径被小写。norm 只用于 isInside 比对。
+  const rel = path.relative(context.root, pAbs);
   emitRewrite({ ...toolInput, path: path.join(binding.worktree, rel) });
 }
 
@@ -191,10 +203,10 @@ function handleBash(toolInput, context) {
     block("删除 worktree 分支必须用户明确授权。", context);
   }
 
-  // 4. merge/rebase/pull 检查
-  if (GIT_MUTATE_RE.test(command)) {
+  // 4. merge/rebase/pull 检查（仅绑定/在副本内时拦截；默认开放态主副本 git 自由）
+  if ((hasBinding || context.in_worktree) && GIT_MUTATE_RE.test(command)) {
     if (protected_.has(branchL)) {
-      block(`当前在受保护分支 ${branch}，merge/rebase/pull 需用户明确授权。`, context);
+      block(`当前有 worktree 绑定/在副本内，在受保护分支 ${branch} 上 merge/rebase/pull 需用户明确授权。`, context);
     }
     const m = GIT_MERGE_TARGET_RE.exec(command);
     if (m) {

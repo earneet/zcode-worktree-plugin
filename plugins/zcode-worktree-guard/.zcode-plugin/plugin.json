@@ -1,7 +1,7 @@
 {
   "name": "zcode-worktree-guard",
-  "version": "0.3.0",
-  "description": "强制 git worktree 工作流：PreToolUse 透明路径重写 + 主 checkout 写保护 + 危险 git 操作拦截",
+  "version": "0.4.0",
+  "description": "可选的 git worktree 隔离：默认主副本自由工作；enter 后锁定到副本，路径自动重写 + 跨副本/危险 git 拦截（push 到 master/main 始终需授权）",
   "author": { "name": "earneet" },
   "license": "MIT",
   "skills": "skills",

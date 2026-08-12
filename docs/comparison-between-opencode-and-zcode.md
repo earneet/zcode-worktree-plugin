@@ -1,5 +1,12 @@
 # opencode-worktree-isolation × zcode-worktree-guard 对比与交流
 
+> **更新（v0.4，2026-08-11）**：本文写作时（v0.3）zcode-worktree-guard 的哲学是"**强制** worktree"。
+> v0.4 起 zcode 改为"**默认主副本开放，按需隔离**"——无绑定时 Write/Edit/本地 git 自由放行，
+> `enter` 后才锁定到副本。因此本文中把 zcode 描述为"强制 / fail-closed 写保护 / 无 binding 拦截"
+> 的行（TL;DR 哲学行、运行时对比 §245、对照表 §498 等）反映的是 **v0.3 及之前的模型**。
+> 两个项目现在的哲学已趋同（都是可选 worktree），差异主要在实现机制。下文保留为历史对比。
+> 此外 v0.4 起 zcode 的绑定只来自本会话 `enter`，`state.json` 不再作为绑定真值。
+
 > **任务来源**: 用户审查 opencode-worktree-isolation 项目是否支持多 session 多 worktree 并行工作，并对比 zcode-worktree-guard 的可借鉴点。完成审查后，用户希望将对比结论（含实现取舍）整理为文档，作为与 zcode-worktree-guard 作者的技术交流材料。
 > **任务内容**: 客观对比两个项目的运行时模型、状态管理、拦截策略、继承机制、合并工作流、测试覆盖度，分析每个设计决策背后的取舍原因，并标注双向借鉴的方向（不仅 opencode 学 zcode，也指出 zcode 可从 opencode 学的点）。
 > **参考文档**:
