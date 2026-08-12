@@ -363,6 +363,51 @@ describe("A. decideWrite 决策表（Write/Edit/Read）", () => {
     assertRewrite(r);
   });
 
+  it("A13b: 重写保留原始大小写文件名（不小写化）", () => {
+    // 回归：曾因 rel 用 norm(小写)过的路径计算，导致 AgentType.java → agenttype.java，
+    // 破坏 Java 类名↔文件名契约（用户报告：Fantasia 项目编译失败）。
+    // norm 只应用于 isInside 比对；rel 必须用原始大小写计算。
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: {
+        file_path: path.join(repo, "scene", "src", "AgentType.java"),
+        content: "x",
+      },
+    });
+    const result = assertRewrite(r);
+    assert.equal(
+      path.basename(result.file_path),
+      "AgentType.java",
+      `重写后文件名被小写化！得到: ${result.file_path}`,
+    );
+    // 中间目录也要保留大小写
+    assert.ok(result.file_path.includes(path.join("scene", "src", "AgentType.java")),
+      `中间路径大小写未保留: ${result.file_path}`);
+  });
+
+  it("A13c: Edit 重写同样保留大小写文件名", () => {
+    const r = runHook({
+      tool_name: "Edit", cwd: repo, session_id: sid,
+      tool_input: {
+        file_path: path.join(repo, "AgentTypeAlignmentTest.java"),
+        old_string: "a", new_string: "b",
+      },
+    });
+    const result = assertRewrite(r);
+    assert.equal(path.basename(result.file_path), "AgentTypeAlignmentTest.java",
+      `Edit 重写后文件名被小写化: ${result.file_path}`);
+  });
+
+  it("A13d: Glob 搜索路径重写保留大小写", () => {
+    const r = runHook({
+      tool_name: "Glob", cwd: repo, session_id: sid,
+      tool_input: { pattern: "*.java", path: path.join(repo, "Src", "Main") },
+    });
+    const result = assertRewrite(r);
+    assert.ok(result.path.includes(path.join("Src", "Main")),
+      `Glob 搜索路径被小写化: ${result.path}`);
+  });
+
   // §2 outside-repo (prefix attack)
   it("A14: Write 路径前缀相似但实际仓库外 → 放行（防 isInside 前缀绕过）", () => {
     const fakeRepo = repo + "-evil";

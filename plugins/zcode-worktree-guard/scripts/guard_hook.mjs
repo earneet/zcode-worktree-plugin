@@ -119,8 +119,11 @@ function decideWrite(target, ctx, isWrite) {
     if (C.isInside(nTarget, nWt)) {
       return { action: "allow", source: "inside-worktree" };
     }
-    // 目标在主 checkout 根下（已排除其他副本）→ 透明重写
-    const rel = path.relative(nRoot, nTarget);
+    // 目标在主 checkout 根下（已排除其他副本）→ 透明重写。
+    // 🔴 rel 必须用【原始大小写】的 root/target 计算，不能用 nRoot/nTarget（norm 小写过）——
+    // 否则文件名被小写，破坏大小写敏感的契约（如 Java 的 类名↔文件名）。norm 只用于上面的
+    // isInside 比对（大小写/分隔符不敏感的包含判断），不参与构造输出路径。
+    const rel = path.relative(ctx.root, target);
     return { action: "rewrite", newTarget: path.join(binding.worktree, rel), source: "rewrite" };
   }
 
@@ -163,7 +166,8 @@ function handleSearchPathTool(toolInput, context) {
 
   if (C.isInside(nP, nWt)) return;
   if (!C.isInside(nP, nRoot)) return;
-  const rel = path.relative(nRoot, nP);
+  // 🔴 用原始大小写算 rel（同 decideWrite），避免搜索路径被小写。norm 只用于 isInside 比对。
+  const rel = path.relative(context.root, pAbs);
   emitRewrite({ ...toolInput, path: path.join(binding.worktree, rel) });
 }
 
