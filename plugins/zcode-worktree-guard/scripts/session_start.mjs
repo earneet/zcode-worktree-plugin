@@ -32,6 +32,7 @@ async function main() {
       `【worktree-guard 已锁定】会话 ${sessionId} 绑定到 worktree：\n` +
       `  路径: ${existingBinding.worktree}\n  分支: ${existingBinding.branch}（来源: ${existingBinding.source}）\n\n` +
       `Write/Edit 写主 checkout 路径会自动重写到该 worktree；跨副本写、git push 到 master/main 仍拦截。\n` +
+      `Bash 提示：每次调用都是新 shell（变量不跨调用保留）；要在副本内跑 git/编译/测试，先单条 cd "${existingBinding.worktree}"（会话工作目录会持久切换），再用相对路径操作；bash 里写绝对主 checkout 路径不会被重写。\n` +
       `退出（回到主副本开放）: echo '{"action":"keep"}' | node "${WT_TOOL}" exit`;
   } else {
     const resolved = C.resolveBinding(common, sessionId);
@@ -41,6 +42,7 @@ async function main() {
         `【worktree-guard 已锁定（继承）】会话 ${sessionId} 通过父会话继承绑定到 worktree：\n` +
         `  路径: ${resolved.worktree}\n  分支: ${resolved.branch}（来源: ${resolved.source}）\n\n` +
         `Write/Edit 写主 checkout 路径会自动重写到该 worktree。\n` +
+        `Bash 提示：每次调用都是新 shell（变量不跨调用保留）；要在副本内跑 git/编译/测试，先单条 cd "${resolved.worktree}"（会话工作目录会持久切换），再用相对路径操作；bash 里写绝对主 checkout 路径不会被重写。\n` +
         `如需换绑: echo '{"path":"<worktree路径>"}' | node "${WT_TOOL}" enter`;
     } else {
       // 默认开放：主副本自由工作

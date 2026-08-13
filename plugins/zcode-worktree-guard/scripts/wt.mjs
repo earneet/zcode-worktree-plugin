@@ -13,6 +13,12 @@ import fs from "node:fs";
 function ok(text) { console.log(JSON.stringify({ content: text })); }
 function fail(text) { ok(`❌ ${text}`); }
 
+// TTL 显示用本地时间（v0.4.2）：裸 UTC ISO 串会被对照本地时钟误读成"已过期/秒过期"。
+function fmtLocal(iso) {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
 function getSessionId() {
   // 经 Bash 工具调用时由 guard_hook 注入 ZCODE_SESSION_ID；终端手工调用则无。
   return C.sessionIdFromEnv() || C.MANUAL_SESSION_ID;
@@ -184,8 +190,18 @@ async function cmdExit(params, cwd) {
       if (rmLink.failed.length) lines.push(`- ⚠️ 移除链接失败: ${rmLink.failed.join("; ")}`);
     }
     const r = C.runGit(["worktree", "remove", wtPath], root);
-    if (r.code !== 0) return fail(`git worktree remove 失败: ${r.stdout}\n` + lines.join("\n"));
-    lines.push(`🗑️ 副本目录已删除（分支 ${branch} 保留）`);
+    if (r.code !== 0) {
+      // v0.4.2 容错：Windows 下 remove 可能半成功（git 已注销注册、目录删除 EPERM，
+      // 如有进程占着副本目录）。此时重试报 "is not a working tree"——视为已注销，
+      // 继续清绑定，目录残留提示手动处理，而不是卡死退出流程。
+      if (/is not a working tree/i.test(r.stdout)) {
+        lines.push(`⚠️ 副本已不在 git 注册表（可能此前 remove 半成功），绑定将清除；目录若有残留请手动删除。`);
+      } else {
+        return fail(`git worktree remove 失败: ${r.stdout}\n` + lines.join("\n"));
+      }
+    } else {
+      lines.push(`🗑️ 副本目录已删除（分支 ${branch} 保留）`);
+    }
   }
 
   C.clearBinding(common, sessionId);
@@ -274,7 +290,7 @@ async function cmdAllow(params, cwd) {
     if (!al.paths || al.paths.length === 0) return ok(`当前仓库无放行路径。`);
     const lines = [`放行路径:`];
     for (const e of al.paths) {
-      const exp = e.expires_at ? ` (至 ${e.expires_at})` : "";
+      const exp = e.expires_at ? ` (至 ${fmtLocal(e.expires_at)} 本地)` : "";
       const by = e.by_session ? ` [by ${e.by_session}]` : "";
       lines.push(`  ${e.path}${exp}${by} — ${e.reason || "无说明"}`);
     }
@@ -307,7 +323,7 @@ async function cmdAllow(params, cwd) {
     path: targetPath, reason, by_session: sessionId, created_at: C.nowIso(), expires_at: expiresAt,
   });
   C.appendAudit(common, { type: "allow_add", sessionId, path: targetPath, reason, expires_at: expiresAt });
-  ok(`✅ 已放行: ${targetPath}\n原因: ${reason || "无"}\n有效期至: ${expiresAt}（by ${sessionId}）\n审计已记录。`);
+  ok(`✅ 已放行: ${targetPath}\n原因: ${reason || "无"}\n有效期至: ${fmtLocal(expiresAt)}（本地时间，约 ${ttlMin} 分钟；by ${sessionId}）\n审计已记录。`);
 }
 
 // ---------------------------------------------------------------------------
