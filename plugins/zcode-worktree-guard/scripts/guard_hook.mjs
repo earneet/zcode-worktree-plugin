@@ -4,6 +4,10 @@
 // v0.4：默认主副本开放——无绑定时 Write/Edit/本地 git 操作放行（不拦截、不重写）；
 //       仅 enter 绑定后才启用透明重写与受保护分支拦截。fail-open（进程异常放行）。
 //       跨副本写入、`.git` 写、git push 到 master/main、删 worktree 分支——始终拦截。
+// v0.4.1：① 会话身份注入——wt.mjs 经 Bash 调用拿不到 ZCode 的 session_id（环境变量
+//       不注入），hook 是唯一知道真实会话 id 的组件，对其 Bash 命令注入
+//       `export ZCODE_SESSION_ID=<id>; ` 前缀（修复 v0.4.0 绑定永远解析失败的回归）；
+//       ② Read 去武器化——.git/跨副本拒绝仅对写生效，读操作永不拦截、不重写错位。
 import * as C from "./common.mjs";
 import path from "node:path";
 import fs from "node:fs";
@@ -60,11 +64,13 @@ function block(reason, ctx) {
 // 返回 {action: "allow"|"deny"|"rewrite", reason, newTarget?, source?}
 // v0.4：默认主副本开放——无绑定写主 checkout 放行；跨副本写入始终拦截。
 
-// 跨副本写入保护：目标落在"另一个"已注册 worktree 副本内 → deny。
+// 跨副本写入保护：目标落在"另一个"已注册 worktree 副本内 → 写 deny / 读 allow。
 // worktree 副本常在 root 内（默认 .worktrees/ 下），不检查会导致：
 //   - 无绑定时：写到别的副本（路径漂移）；
 //   - 有绑定时：被错误重写到自身副本（静默错位）。
 // 此检查无论有无绑定都生效。跳过主 checkout（path===root）与（有绑定时）自身副本。
+// v0.4.1：读别的副本无害（对比/排障常需要），改为放行——v0.4.0 曾因绑定解析失败
+// 把 agent 连自己副本的读操作都拦死。放行而非落入重写分支，避免路径错拼到自身副本下。
 function crossWorktreeDeny(nTarget, ctx) {
   const nRoot = C.norm(ctx.root);
   const nWt = ctx.binding ? C.norm(ctx.binding.worktree) : null;
@@ -82,10 +88,11 @@ function decideWrite(target, ctx, isWrite) {
   const nRoot = C.norm(ctx.root);
   const binding = ctx.binding; // resolveBinding 结果，可能 null
 
-  // 1. .git 保护（硬规则）
+  // 1. .git 保护（硬规则；写拒绝。读取 .git 内文件无害且常用于排障 → 放行原路径）
   const nGit = C.norm(path.join(ctx.root, ".git"));
   if (C.isInside(nTarget, nGit)) {
-    return { action: "deny", reason: "目标路径在 .git 下，禁止操作（保护 git 元数据）。" };
+    if (isWrite) return { action: "deny", reason: "目标路径在 .git 下，禁止操作（保护 git 元数据）。" };
+    return { action: "allow", source: "read-git-dir" };
   }
 
   // 2. 仓库外放行
@@ -108,9 +115,12 @@ function decideWrite(target, ctx, isWrite) {
     return { action: "allow", source: "global-authorize" };
   }
 
-  // 6. 跨副本写入保护（始终生效，不论有无绑定）
+  // 6. 跨副本写入保护（始终生效，不论有无绑定；写拒绝，读放行——见 crossWorktreeDeny 注释）
   if (crossWorktreeDeny(nTarget, ctx)) {
-    return { action: "deny", reason: "目标路径在其他 worktree 副本内，不允许跨副本写入。" };
+    if (isWrite) {
+      return { action: "deny", reason: "目标路径在其他 worktree 副本内，不允许跨副本写入。" };
+    }
+    return { action: "allow", source: "read-cross-worktree" };
   }
 
   // 7. 有绑定：写副本内放行；写主 checkout 根下 → 透明重写
@@ -172,6 +182,26 @@ function handleSearchPathTool(toolInput, context) {
 }
 
 // ---------------------------------------------------------------------------
+// 会话身份注入（v0.4.1 主修）：
+// wt.mjs 由 agent 经 Bash 工具调用，而 ZCode 不向 Bash 子进程注入任何会话环境变量，
+// wt.mjs 自身只能落到 cli-manual 兜底 id——与 hook（payload 真实 session_id）错位，
+// 导致 enter 写入的绑定对 hook 永远不可见（v0.4.0 回归：重写失效 + 跨副本误拦）。
+// 唯一知道真实会话 id 的组件是 hook，因此由它把 id 注入 wt.mjs 命令的环境前缀，
+// 身份随进程确定性传递（无锁文件、无竞态）。ZCode 引擎对 updatedInput 的应用是
+// 工具无关的 input 级替换（已核实 zcode.cjs 源码），Bash.command 重写天然支持。
+
+const WT_CMD_RE = /\bwt\.mjs\b/;
+
+function injectSessionEnv(command, sessionId) {
+  // 返回注入后的命令；不满足条件返回 null（调用方按原命令继续）。
+  if (!WT_CMD_RE.test(command)) return null;               // 只处理 wt.mjs 调用
+  if (!sessionId || sessionId === C.MANUAL_SESSION_ID) return null; // 手工/无会话上下文
+  if (!C.SAFE_SESSION_ID_RE.test(sessionId)) return null;  // 异常 id 不拼 shell（防注入）
+  if (command.includes(`${C.SESSION_ENV}=`)) return null;  // 已有注入/显式设置（幂等）
+  return `export ${C.SESSION_ENV}=${sessionId}; ${command}`;
+}
+
+// ---------------------------------------------------------------------------
 function handleBash(toolInput, context) {
   const command = toolInput.command || "";
   if (!command) return;
@@ -213,21 +243,24 @@ function handleBash(toolInput, context) {
       block(`检测到合并 ${m[2]} 到 ${branch}。worktree 分支只能合并到主分支，且须用户授权。`, context);
     }
   }
+
+  // 5. 会话身份注入（放在所有拦截检查之后——绝不因注入而跳过任何拦截）。
+  //    对 `node .../wt.mjs enter` 这类命令注入 export 前缀后由 updatedInput 生效。
+  const injected = injectSessionEnv(command, context.sessionId);
+  if (injected != null) {
+    emitRewrite({ ...toolInput, command: injected });
+  }
 }
 
 // ---------------------------------------------------------------------------
+// fail-open 审计锚点：main() 内解析出 git 上下文后记录，异常路径据此写审计日志。
+let auditCommon = null;
+
 async function main() {
-  const raw = await new Promise((resolve) => {
-    let data = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (c) => (data += c));
-    process.stdin.on("end", () => resolve(data));
-    setTimeout(() => resolve(data), 100);
-  });
-  let ctx = {};
-  try { ctx = raw.trim() ? JSON.parse(raw.replace(/^\ufeff/, "")) : {}; } catch { ctx = {}; }
+  const raw = await C.readStdinJson();
+  const ctx = C.parseHookPayload(raw);
   const cwd = ctx.cwd || process.cwd();
-  const sessionId = ctx.session_id || process.env.ZCODE_SESSION_ID || "cli-manual";
+  const sessionId = C.resolveSessionId(ctx);
   const toolName = ctx.tool_name || "";
   const toolInput = ctx.tool_input || {};
 
@@ -247,6 +280,7 @@ async function main() {
     inWt = C.inLinkedWorktree(root);
   }
   if (!common) return; // 非 git → 放行
+  auditCommon = common; // 供异常路径审计
 
   // v0.2：三层降级解析绑定
   const binding = C.resolveBinding(common, sessionId);
@@ -273,4 +307,13 @@ async function main() {
   }
 }
 
-main().catch(() => process.exit(0));
+// fail-open：内部异常一律放行（不阻塞用户工具调用），但留审计 + stderr 痕迹，
+// 避免 v0.4.0 那样"静默吞异常伪装成放行"（排障时极不友好）。
+main().catch((e) => {
+  const msg = e && e.message ? `${e.constructor?.name}: ${e.message}` : String(e);
+  try {
+    if (auditCommon) C.appendAudit(auditCommon, { type: "hook_error", error: msg });
+  } catch { /* 审计失败不影响放行 */ }
+  process.stderr.write(`worktree-guard: 内部错误（已放行）: ${msg}\n`);
+  process.exit(0);
+});

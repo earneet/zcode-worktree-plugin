@@ -9,17 +9,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WT_TOOL = path.join(__dirname, "wt.mjs");
 
 async function main() {
-  const raw = await new Promise((resolve) => {
-    let data = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (c) => (data += c));
-    process.stdin.on("end", () => resolve(data));
-    setTimeout(() => resolve(data), 100);
-  });
-  let ctx = {};
-  try { ctx = raw.trim() ? JSON.parse(raw.replace(/^\ufeff/, "")) : {}; } catch { ctx = {}; }
+  const raw = await C.readStdinJson();
+  const ctx = C.parseHookPayload(raw);
   const cwd = ctx.cwd || process.cwd();
-  const sessionId = ctx.session_id || process.env.ZCODE_SESSION_ID || "cli-manual";
+  const sessionId = C.resolveSessionId(ctx);
 
   const common = C.gitCommonDir(cwd);
   if (!common) return; // 非 git → 静默

@@ -322,6 +322,8 @@ const GIT_CHECKOUT_RE = /\bgit\s+(checkout|switch)\s+([^\s;|&..."<>()-]...)/i
 
 **设计取舍**：zcode 把 allowlist 设计为"仓库级单文件"而不是"每 session 一文件"是个值得讨论的决策。理由是 wt.mjs（agent 通过 Bash 调用）和 hook（宿主 spawn）的 session_id 来源不同（一个来自 `ZCODE_SESSION_ID` env，一个来自 hook stdin），按 session 分文件会错配。**opencode 单进程下不存在这个问题**——所有调用都在同进程，sessionID 一致。所以 opencode 引入逃生口时可以做成"每 session 一文件"，更符合最小权限原则。
 
+> **v0.4.1 后记**：同一个 session 来源错位也曾打到 `bindings/` 本身——v0.4.0 移除 state.json 兜底后，enter 写入的绑定（`cli-manual`）对 hook（payload 真实 `sess_*`）永远不可见，造成线上回归（重写失效 + 跨副本误拦）。v0.4.1 的修复不是把 bindings 也降级为仓库级，而是**由 guard_hook 对调用 wt.mjs 的 Bash 命令注入 `export ZCODE_SESSION_ID=<id>; ` 前缀**（updatedInput），让身份随进程环境传递——per-session 语义与 DB 继承全部保留。allowlist 保持仓库级不动（逃生口本来就是仓库语义）。
+
 ---
 
 ## 5. 继承机制对比

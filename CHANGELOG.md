@@ -2,6 +2,72 @@
 
 本文件记录 zcode-worktree-guard 的版本演进。详细设计见 [docs/design.md](docs/design.md)。
 
+## [0.4.1] — 2026-08-13
+
+### 🔴 修复 v0.4.0 线上回归：绑定永远解析失败（会话身份错位）
+
+外部 agent 实际使用中报告（高危）：`wt.mjs status` 显示会话已绑定，guard hook 却报
+"活动 worktree: 无"——三连锁症状：
+
+1. `enter` 后写主 checkout 路径**不重写**，改动直写 master（需手工回滚）；
+2. 直接以 worktree 绝对路径 Edit/Read 被**误拦**（"目标路径在其他 worktree 副本内"）；
+3. 拦截上下文误报 `(detached HEAD)` 等虚假 git 状态。
+
+**根因**：ZCode 只把 `session_id` 放进 hook 的 stdin payload，**从不注入 Bash 工具子进程
+的环境变量**（已实测穷举）。`wt.mjs`（agent 经 Bash 调用）的 `getSessionId()` 只能落到
+`cli-manual` 兜底，而 hook 用 payload 里的真实 `sess_*` 查询 `bindings/`——两侧 key 永远
+对不上。v0.3 的 `state.json` 兜底恰好掩盖了这一错位；v0.4 为修跨会话残留而移除兜底，
+错位随即致命。测试套件没抓到是因为用例直接把 `session_id` 注入 hook payload，写侧与读侧
+构造上同 id，无法暴露"两侧来源不同"的结构问题。
+
+**修复（会话身份注入）**：hook 是唯一知道真实会话 id 的组件。`guard_hook` 在 PreToolUse
+检测到 Bash 命令调用 `wt.mjs` 时，经 `updatedInput` 给命令注入
+`export ZCODE_SESSION_ID=<id>; ` 前缀——身份随进程环境确定性传递，无锁文件、无竞态，
+保留 per-session 绑定与 subagent DB 继承的全部语义。已核实 ZCode 引擎（zcode.cjs）对
+`updatedInput` 的应用是工具无关的 input 级替换，Bash.command 重写天然支持。防注入：id
+仅放行 `^[A-Za-z0-9._-]+$`；幂等：命令已含 `ZCODE_SESSION_ID=` 时跳过；次序：注入在
+全部拦截检查**之后**，绝不因注入跳过保护。新增 N04 端到端回归锁（注入 → enter → hook
+以 payload id 解析 → 透明重写）。
+
+### 行为变化：Read 去武器化
+
+与"默认开放"哲学对齐——**读操作永不拦截**：
+
+| 场景 | v0.4.0 | v0.4.1 |
+|---|---|---|
+| Read / Glob / Grep 其他 worktree 副本（无论有无绑定） | 🔴 拦截 | ✅ 放行（对比/排障常需） |
+| Read `.git` 内文件 | 🔴 拦截 | ✅ 放行（写仍拦截） |
+| 有绑定 Read 主 checkout 路径 | ✅ 透明重写 | ✅ 不变（视图一致性） |
+
+有绑定 Read 其他副本时放行而非重写，避免把 `.worktrees/other/...` 错拼到自身副本下。
+
+### 其他修复
+
+- **MSYS 路径归一化**：Git Bash 里 `cd /f/...`、`/cygdrive/f/...` 是合法 Windows 路径，
+  但 `extractCdTarget` 直接 `path.resolve` 会得到 `F:\f\...` 垃圾路径 → `currentBranch`
+  误报 `(detached HEAD)`、Bash 防护整段静默跳过。现归一化为 `F:\...`；且 cd 目标不存在时
+  返回 null（对齐真实 bash "cd 失败停留在原 cwd"的语义）。
+- **currentBranch 区分失败**：git 调用失败（code≠0）报 `(git 调用失败)`，不再与真
+  detached HEAD（code=0 空输出）混淆——拦截上下文不再撒谎。
+- **fail-open 可诊断**：hook 内部异常原先被 `catch(() => exit 0)` 静默吞掉（排障时伪装成
+  放行）；现写 `audit.jsonl`（`type:"hook_error"`）+ stderr 单行，放行语义不变。
+- **status 自诊断**：检测到 `cli-manual` 绑定时提示"该绑定来自无会话环境，ZCode 会话
+  不可见；在会话内重新 enter 可修复"——本次事故的现场特征直接变成下次的自提示。
+- **工程整理**：会话 id 解析（`resolveSessionId`/`sessionIdFromEnv`）与 hook stdin
+  读取/解析（`readStdinJson`/`parseHookPayload`）收敛到 `common.mjs`，消除三脚本重复。
+
+### 测试
+
+`tests/v2.test.mjs` 新增 N 组 13 用例（会话注入格式/幂等/防注入/端到端回归锁/exit 会话
+隔离/status 提示/Read 三态/拦截优先级/MSYS 归一化/cd 语义/分支误报），全量 **148 用例
+全绿**（135 既有零翻转——既有 Read 用例与新语义天然兼容）。
+
+### 升级提示
+
+live 运行时是 ZCode 的插件缓存副本：升级安装/重载插件后修复才生效。旧版本留下的
+`bindings/cli-manual.json` 对会话不可见，`wt.mjs status` 现在会明确提示，在会话内重新
+`enter` 即可修复。
+
 ## [0.4.0] — 2026-08-12
 
 ### 哲学转变：强制 → 默认开放

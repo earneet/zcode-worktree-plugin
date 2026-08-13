@@ -124,10 +124,11 @@ echo '{}' | node <plugin>/scripts/wt.mjs revoke-main
 | 无绑定，Write/Edit/Read 主 checkout | ✅ 放行（默认开放，不重写不拦截） |
 | 无绑定，本地 `git merge/rebase/pull/checkout` | ✅ 放行 |
 | 无绑定，`git push` 到 master/main | 🔴 拦截（安全网，需授权） |
-| 有绑定，写主 checkout 路径 | ✅ **自动重写**到 worktree |
+| 有绑定，写主 checkout 路径 | ✅ **自动重写**到 worktree（Read 同样重写，保持视图一致） |
 | 有绑定，写副本内路径 | ✅ 放行 |
 | 有绑定，Glob/Grep 无 path | ✅ 自动注入 path=worktree |
-| 写**其他** worktree 副本（不论有无绑定） | 🔴 拦截（跨副本保护） |
+| **写**其他 worktree 副本（不论有无绑定） | 🔴 拦截（跨副本保护） |
+| **Read** 其他 worktree 副本 / `.git` 内文件 | ✅ 放行（读无害，对比/排障常需；v0.4.1） |
 | 路径命中白名单或 allowlist | ✅ 放行（写主目录，不重写） |
 | 写 `.git` 路径 | 🔴 拦截（硬规则，优先于一切） |
 | 有绑定/在副本内，受保护分支上 `git merge/rebase/pull` | 🔴 拦截（需授权） |
@@ -200,11 +201,25 @@ echo '{"action":"clear"}' | node <plugin>/scripts/wt.mjs allow   # 清空
 
 > `state.json` 只记录最近一次活动 worktree，**不产生绑定**——这保证上个会话的 `enter` 不会把新会话自动锁进副本。
 
+### 会话身份注入（v0.4.1）
+
+ZCode 只把 `session_id` 放进 hook 的 stdin payload，**不注入 Bash 工具子进程的环境变量**——
+`wt.mjs`（agent 经 Bash 调用）自身拿不到真实会话 id。v0.4.0 曾因此出现"enter 写入的绑定
+对 hook 永远不可见"的线上回归（重写失效 + 跨副本误拦）。
+
+修复机制：`guard_hook` 在 PreToolUse 检测到 Bash 命令调用 `wt.mjs` 时，经 `updatedInput`
+注入 `export ZCODE_SESSION_ID=<会话id>; ` 命令前缀——身份随进程环境确定性传递（无锁文件、
+无竞态）。id 仅放行 `^[A-Za-z0-9._-]+$`（防 shell 注入），已含该变量时跳过（幂等），且注入
+发生在全部拦截检查之后（不跳过任何保护）。
+
+终端手工调用 `wt.mjs`（无会话上下文）落到 `cli-manual` 兜底 id——该绑定对 ZCode 会话
+不可见，`wt.mjs status` 会明确提示。
+
 ## 设计与实现
 
 - **[docs/design.md](docs/design.md)** — 完整设计文档：契约证据（PreToolUse 改写能力的实测验证）、架构决策、审计修正记录、已知边界
 - 纯 Node.js ESM（`.mjs`），与 ZCode 同栈，零运行时依赖
-- **112 个自动化测试用例**（`node --test tests/v2.test.mjs`）：覆盖决策表、Bash 拦截、绑定三层降级、白名单、allowlist、生命周期、SessionStart 等全部子系统
+- **148 个自动化测试用例**（`node --test tests/v2.test.mjs`）：覆盖决策表、Bash 拦截、绑定三层降级、白名单、allowlist、生命周期、SessionStart、会话身份注入端到端（N 组）等全部子系统
 
 ## License
 
