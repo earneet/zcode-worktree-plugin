@@ -3,6 +3,9 @@
 // create/enter/exit/status/authorize-main/revoke-main/allow
 // session 级绑定（bindings/<session_id>.json）+ subagent 继承 + 悬空检查。
 // v0.4：默认主副本开放——绑定只由本会话 enter 产生；state.json 仅记录最近活动 + 授权标记。
+// v0.4.1：会话 id 依赖注入——正常路径下 guard_hook 会给本脚本的 Bash 命令注入
+//        ZCODE_SESSION_ID（见 guard_hook.mjs injectSessionEnv）；env 缺失（终端手工
+//        调用/hook 未生效）时落到 cli-manual，该绑定对 ZCode 会话不可见。
 import * as C from "./common.mjs";
 import path from "node:path";
 import fs from "node:fs";
@@ -10,18 +13,9 @@ import fs from "node:fs";
 function ok(text) { console.log(JSON.stringify({ content: text })); }
 function fail(text) { ok(`❌ ${text}`); }
 
-async function readStdin() {
-  return new Promise((resolve) => {
-    let data = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (c) => (data += c));
-    process.stdin.on("end", () => resolve(data));
-    setTimeout(() => resolve(data), 50);
-  });
-}
-
 function getSessionId() {
-  return process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "cli-manual";
+  // 经 Bash 工具调用时由 guard_hook 注入 ZCODE_SESSION_ID；终端手工调用则无。
+  return C.sessionIdFromEnv() || C.MANUAL_SESSION_ID;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +217,12 @@ async function cmdStatus(params, cwd) {
   } else {
     for (const b of bindings) {
       const mark = b.sessionId === sessionId ? " ← 当前会话" : "";
-      lines.push(`  ${b.sessionId}: ${b.worktree} [${b.branch}] (${b.source || "?"})${mark}`);
+      // 自诊断（v0.4.1）：cli-manual 绑定来自无会话环境（hook 注入未生效或终端手工调用），
+      // ZCode 会话的 hook 读不到它——正是 v0.4.0 回归的现场特征，直接提示修复方式。
+      const manualNote = b.sessionId === C.MANUAL_SESSION_ID
+        ? " ⚠️ 无会话环境写入：ZCode 会话内不可见（重写不会生效）；在 ZCode 会话内重新 enter 可修复"
+        : "";
+      lines.push(`  ${b.sessionId}: ${b.worktree} [${b.branch}] (${b.source || "?"})${mark}${manualNote}`);
     }
   }
 
@@ -314,9 +313,8 @@ async function cmdAllow(params, cwd) {
 // ---------------------------------------------------------------------------
 async function main() {
   const action = process.argv[2] || "";
-  const raw = (await readStdin()).replace(/^\ufeff/, "");
-  let params = {};
-  try { params = raw.trim() ? JSON.parse(raw) : {}; } catch { params = {}; }
+  const raw = await C.readStdinJson(50);
+  const params = C.parseHookPayload(raw);
   const cwd = process.cwd();
 
   if (C.gitCommonDir(cwd) === null) {

@@ -15,6 +15,7 @@
 //   H  wt.mjs 生命周期子命令
 //   I  SessionStart hook 4 分支
 //   K  鲁棒性 / 边界
+//   N  会话身份贯通（v0.4.1 回归锁）+ Read 去武器化 + MSYS 路径/分支误报
 
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -1699,5 +1700,165 @@ describe("M. v0.3 文件同步 + 清理安全", () => {
     const copied = path.join(repo, ".worktrees", "worktree-feat", ".env");
     assert.ok(fs.existsSync(copied), ".env 应已复制到 worktree");
     assert.equal(fs.readFileSync(copied, "utf8"), "SECRET=abc");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// N. 会话身份贯通（v0.4.1 回归锁）+ Read 去武器化 + MSYS 路径/分支误报
+//
+// 背景（v0.4.0 线上回归）：wt.mjs 经 Bash 调用拿不到 ZCODE 的 session_id（环境
+// 变量不注入），enter 写到 cli-manual 名下；hook 用 payload 真实 sess_* 查询 →
+// 绑定永远解析失败 → 重写失效（直写 master）+ 跨副本误拦（连 Read 都拦）。
+// v0.4.1 修复：guard_hook 对调用 wt.mjs 的 Bash 命令注入 `export ZCODE_SESSION_ID=
+// <id>; ` 前缀（updatedInput），身份随进程环境传递。N04 是本回归的端到端锁。
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("N. 会话身份贯通 + Read 去武器化 + MSYS 路径", () => {
+  let repo, common, sid, wtPath, otherWt;
+
+  before(() => {
+    repo = makeRepo();
+    common = repoCommon(repo);
+    sid = "sess_n_bound";
+    runWt("create", { task_name: "feat" }, { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+    wtPath = path.join(repo, ".worktrees", "worktree-feat");
+    runWt("create", { task_name: "other" }, { env: { ZCODE_SESSION_ID: "sess_n_maker" }, cwd: repo });
+    otherWt = path.join(repo, ".worktrees", "worktree-other");
+  });
+  after(() => cleanupRepo(repo));
+
+  // --- 会话身份注入 ---
+
+  it("N01: Bash 调用 wt.mjs → hook 注入 export ZCODE_SESSION_ID 前缀（命令逐字保留）", () => {
+    const cmd = `echo '{"path":".worktrees/worktree-feat"}' | node "${WT}" enter`;
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: cmd },
+    });
+    assert.equal(r.code, 0, `期望 exit 0，实际 ${r.code}; stderr: ${r.stderr.slice(0, 200)}`);
+    const newCmd = JSON.parse(r.stdout).hookSpecificOutput?.updatedInput?.command;
+    assert.equal(newCmd, `export ZCODE_SESSION_ID=${sid}; ${cmd}`,
+      `注入后命令不符合预期: ${newCmd}`);
+  });
+
+  it("N02: 命令已含 ZCODE_SESSION_ID= → 幂等，不再注入", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: `export ZCODE_SESSION_ID=sess_x; node "${WT}" status` },
+    });
+    assertPass(r);
+  });
+
+  it("N03: 不安全 session_id（含空格/引号）→ 不注入（防 shell 注入）", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: 'bad"id; echo pwned',
+      tool_input: { command: `node "${WT}" status` },
+    });
+    assertPass(r);
+  });
+
+  it("N04: 🔴 端到端回归锁：注入身份 enter → hook 以 payload id 解析绑定 → 透明重写", () => {
+    // 1) hook 看到的真实结构：agent 在 Bash 工具里调 wt.mjs enter（写侧无会话 env）
+    const cmd = `echo '{"path":".worktrees/worktree-feat"}' | node "${WT}" enter`;
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: cmd },
+    });
+    // 2) 从注入命令提取 export 的 id（模拟真实 shell 执行该命令时的环境）
+    const newCmd = JSON.parse(r.stdout).hookSpecificOutput.updatedInput.command;
+    const m = newCmd.match(/^export ZCODE_SESSION_ID=([^;]+); /);
+    assert.ok(m, `注入前缀缺失: ${newCmd.slice(0, 120)}`);
+    assert.equal(m[1], sid);
+    // 3) wt.mjs 在该 env 下运行 enter（= 注入后命令的真实效果）
+    const er = runWt("enter", { path: ".worktrees/worktree-feat" }, { env: { ZCODE_SESSION_ID: m[1] }, cwd: repo });
+    assertWtOk(er, "已进入 worktree");
+    // 4) hook 以 payload session_id（与 env 同值）解析绑定 → 主 checkout 写入被重写
+    const wr = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(repo, "n04.js"), content: "x" },
+    });
+    assertRewrite(wr, wtPath);
+  });
+
+  it("N05: exit 经注入身份运行 → 只清本会话绑定，他 session 绑定不受影响", () => {
+    runWt("enter", { path: ".worktrees/worktree-other" }, { env: { ZCODE_SESSION_ID: "sess_n05b" }, cwd: repo });
+    const xr = runWt("exit", { action: "keep" }, { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+    assertWtOk(xr, "本会话绑定已清除");
+    assert.equal(C.loadBinding(common, sid), null, "本会话绑定应已清除");
+    const other = C.loadBinding(common, "sess_n05b");
+    assert.ok(other && other.worktree, "其他会话绑定不应被误清");
+    runWt("exit", { action: "keep" }, { env: { ZCODE_SESSION_ID: "sess_n05b" }, cwd: repo });
+  });
+
+  it("N06: 无会话 env 的 enter 落 cli-manual，status 提示该绑定对 ZCode 会话不可见", () => {
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { cwd: repo }); // 无 env（终端手工调用形态）
+    const st = wtContent(runWt("status", {}, { cwd: repo }));
+    assert.ok(st.includes("cli-manual"), `status 应列出 cli-manual 绑定: ${st.slice(0, 300)}`);
+    assert.ok(st.includes("不可见"), `status 应提示 cli-manual 绑定对会话不可见: ${st.slice(0, 300)}`);
+    runWt("exit", { action: "keep" }, { cwd: repo }); // 清理
+  });
+
+  // --- Read 去武器化（v0.4.1：默认开放哲学下读操作永不拦截） ---
+
+  it("N07: 无绑定 Read 其他 worktree 副本 → 放行（v0.4.0 曾误拦）", () => {
+    const r = runHook({
+      tool_name: "Read", cwd: repo, session_id: "sess_n_nobody",
+      tool_input: { file_path: path.join(otherWt, "z.js") },
+    });
+    assertPass(r);
+  });
+
+  it("N08: 无绑定 Read .git → 放行（读取排障无害；写仍拦截）", () => {
+    const r = runHook({
+      tool_name: "Read", cwd: repo, session_id: "sess_n_nobody",
+      tool_input: { file_path: path.join(repo, ".git", "config") },
+    });
+    assertPass(r);
+  });
+
+  it("N09: 有绑定 Read 其他副本 → 放行且不重写（防路径错拼到自身副本下）", () => {
+    // N05 已清除本组 sid 的绑定，此处自持重建（用例间不依赖执行顺序之外的隐式状态）
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+    const r = runHook({
+      tool_name: "Read", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(otherWt, "z.js") },
+    });
+    assertPass(r); // 放行 = 不产生 updatedInput（重写会把路径拼进自身副本，错位）
+  });
+
+  it("N10: Bash 命令同时含 wt.mjs 与危险 git 操作 → 拦截优先（注入不跳过保护）", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: `node "${WT}" enter && git push origin master` },
+    });
+    assertBlock(r, "push");
+  });
+
+  // --- MSYS 路径归一化 + git 上下文误报 ---
+
+  it("N11: extractCdTarget 归一化 Git Bash 盘符路径（/f/... 与 /cygdrive/f/...）", () => {
+    if (process.platform !== "win32") return; // POSIX 上无此形态
+    const sub = fs.mkdtempSync(path.join(os.tmpdir(), "wtg-msys-"));
+    const drive = sub[0].toLowerCase();
+    const msys = `/${drive}${sub.slice(2).replace(/\\/g, "/")}`;
+    assert.equal(C.extractCdTarget(`cd ${msys} && git status`, "F:\\cur"), sub);
+    assert.equal(C.extractCdTarget(`cd /cygdrive${msys} && git status`, "F:\\cur"), sub);
+  });
+
+  it("N12: cd 到不存在目录 → 视为无有效 cd（对齐 bash 失败停留在原 cwd 的语义）", () => {
+    assert.equal(C.extractCdTarget("cd /definitely/not/exists && git status", "F:\\cur"), null);
+  });
+
+  it("N13: currentBranch 区分 git 失败与真 detached HEAD（不再误报）", () => {
+    assert.equal(C.currentBranch(path.join(os.tmpdir(), "wtg-no-such-n13")), "(git 调用失败)");
+    const repo2 = makeRepo();
+    try {
+      assert.equal(C.currentBranch(repo2), "master");
+      spawnSync("git", ["checkout", "-q", "--detach"], { cwd: repo2, encoding: "utf8" });
+      assert.equal(C.currentBranch(repo2), "(detached HEAD)");
+    } finally {
+      cleanupRepo(repo2);
+    }
   });
 });

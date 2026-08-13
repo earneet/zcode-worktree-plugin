@@ -3,6 +3,9 @@
 // v0.2：会话级绑定（bindings/ 每session一文件）+ DB parent 继承。
 // v0.4：默认主副本开放——绑定只来自本会话 enter（或 subagent 继承父链 enter），
 //       state.json 不再作为绑定真值（仅保留 globalAllow / 审计 / 状态显示）。
+// v0.4.1：会话身份贯通——ZCode 只把 session_id 放进 hook 的 stdin payload，从不注入
+//       Bash 子进程环境，wt.mjs 自身拿不到真实会话 id（v0.4.0 回归根因）。由
+//       guard_hook 在 PreToolUse 对调用 wt.mjs 的 Bash 命令注入会话环境变量解决。
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs";
@@ -22,6 +25,45 @@ export const DEFAULT_PARENT = ".worktrees";
 export const DEFAULT_PROTECTED = ["master", "main"];
 export const TASK_NAME_RE = /^[a-z0-9][a-z0-9-]{0,49}$/;
 export const SCHEMA_VERSION = 2;
+
+// ---------------------------------------------------------------------------
+// 会话身份（v0.4.1）
+// ZCode 的 session_id 只出现在 hook 的 stdin payload（guard_hook / session_start），
+// Bash 工具子进程环境里没有任何会话变量（已实测穷举）。因此 wt.mjs（agent 经
+// Bash 调用）自身永远拿不到真实会话 id——v0.4.0 "绑定永远解析失败"的根因。
+// 贯通方式：guard_hook 用 updatedInput 给调用 wt.mjs 的 Bash 命令注入
+// `export ZCODE_SESSION_ID=<id>; ` 前缀，身份随进程环境确定性传递。
+
+export const SESSION_ENV = "ZCODE_SESSION_ID";
+export const MANUAL_SESSION_ID = "cli-manual";
+// id 会被拼进 shell 命令（export 前缀），只放行无元字符/引号的形态，防注入。
+export const SAFE_SESSION_ID_RE = /^[A-Za-z0-9._-]+$/;
+
+export function sessionIdFromEnv() {
+  return process.env[SESSION_ENV] || process.env.CLAUDE_SESSION_ID || null;
+}
+
+export function resolveSessionId(ctx) {
+  // hook 侧统一入口：payload session_id（真实来源）优先 → env → cli-manual。
+  return (ctx && ctx.session_id) || sessionIdFromEnv() || MANUAL_SESSION_ID;
+}
+
+// ---------------------------------------------------------------------------
+// hook stdin 读取与解析（三个脚本共用；BOM 兼容 + 容错空/坏 JSON）
+
+export function readStdinJson(timeoutMs = 100) {
+  return new Promise((resolve) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (c) => (data += c));
+    process.stdin.on("end", () => resolve(data));
+    setTimeout(() => resolve(data), timeoutMs);
+  });
+}
+
+export function parseHookPayload(raw) {
+  try { return raw.trim() ? JSON.parse(raw.replace(/^\ufeff/, "")) : {}; } catch { return {}; }
+}
 
 // ---------------------------------------------------------------------------
 // 路径归一化（Windows 大小写不敏感）
@@ -99,7 +141,9 @@ export function findGitContextForCwd(cwd) {
 
 export function currentBranch(cwd) {
   const { code, stdout } = runGit(["branch", "--show-current"], cwd, { timeout: 10 });
-  return code === 0 && stdout ? stdout : "(detached HEAD)";
+  if (code !== 0) return "(git 调用失败)";
+  // code=0 且空输出 = 真 detached HEAD；git 失败（路径无效/git 缺失）不再误报成 detached
+  return stdout || "(detached HEAD)";
 }
 
 export function inLinkedWorktree(cwd) {
@@ -556,6 +600,17 @@ function resolveInherited(common, sessionId, depth = 0) {
 
 const CD_RE = /(?:^|[;&|]\s*|\band\b\s+)cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|`$()]+))/m;
 
+// Git Bash/MSYS 风格盘符路径 → Windows 路径。
+// `/f/foo` 与 `/cygdrive/f/foo` 在真实 Git Bash 里是 F:\foo，但 path.resolve 会把
+// `/f/foo` 解析成 `<当前盘>:\f\foo` 垃圾路径（曾致 currentBranch 误报 detached HEAD
+// 且 Bash 防护整段被跳过）。仅匹配单字母盘符，不影响多字母 POSIX 路径。
+function msysToWinPath(p) {
+  if (process.platform !== "win32") return p;
+  const m = p.match(/^\/cygdrive\/([a-z])\/(.*)$/i) || p.match(/^\/([a-z])\/(.*)$/i);
+  if (!m) return p;
+  return `${m[1].toUpperCase()}:\\${m[2].replace(/\//g, "\\")}`;
+}
+
 export function extractCdTarget(command, cwd) {
   const re = new RegExp(CD_RE.source, "gm");
   let last = null;
@@ -566,8 +621,13 @@ export function extractCdTarget(command, cwd) {
   if (!last) return null;
   let target = last;
   if (target.startsWith("~")) target = target.replace(/^~/, process.env.HOME || process.env.USERPROFILE || "~");
+  target = msysToWinPath(target);
   if (!path.isAbsolute(target)) target = path.join(String(cwd), target);
-  return path.resolve(target);
+  target = path.resolve(target);
+  // 语义对齐真实 bash：cd 到不存在的目录会失败并停留在原 cwd，后续命令仍在原目录
+  // 执行。解析出不存在的目标应视为"无有效 cd"，而不是拿垃圾路径当工作目录。
+  if (!fs.existsSync(target)) return null;
+  return target;
 }
 
 // ---------------------------------------------------------------------------
