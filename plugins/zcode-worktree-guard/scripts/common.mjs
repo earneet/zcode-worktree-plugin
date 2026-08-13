@@ -611,6 +611,41 @@ function msysToWinPath(p) {
   return `${m[1].toUpperCase()}:\\${m[2].replace(/\//g, "\\")}`;
 }
 
+// 同一条命令内的简单 shell 变量解析：收集 `NAME=值` 赋值，替换 $NAME / "${NAME}"。
+// 背景：ZCode Bash 每次调用都是全新 shell，跨调用变量不保留；agent 常在同一命令内
+// `WT="F:/..."` 赋值后用 `git -C "$WT" ...`。hook 不解 shell，但解析这一最常见形态
+// 可让 cd/-C 语境提取拿到真实路径（反馈 v0.4.2 症状③的实发命令即此形态）。
+// 只做替换、不执行任何东西；替换后路径不存在时由调用方的存在性检查兜底。
+const SHELL_ASSIGN_RE = /(?:^|[\s;&|(\n])([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s;&|)`()]+))/g;
+
+function collectShellVars(command) {
+  const vars = new Map();
+  let m;
+  const re = new RegExp(SHELL_ASSIGN_RE.source, "g");
+  while ((m = re.exec(command)) !== null) {
+    vars.set(m[1], m[2] ?? m[3] ?? m[4] ?? "");
+  }
+  return vars;
+}
+
+function resolveShellVars(str, vars) {
+  if (!vars.size || !str.includes("$")) return str;
+  return str.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (all, braced, plain) => {
+      const name = braced || plain;
+      return vars.has(name) ? vars.get(name) : all;
+    });
+}
+
+function resolveCommandPath(rawTarget, command, baseDir) {
+  // 公共路径解析：同命令变量替换 → MSYS 归一化 → 相对路径基于 baseDir → 存在性检查。
+  const vars = collectShellVars(command);
+  let target = msysToWinPath(resolveShellVars(rawTarget, vars));
+  if (!path.isAbsolute(target)) target = path.join(String(baseDir), target);
+  target = path.resolve(target);
+  return fs.existsSync(target) ? target : null;
+}
+
 export function extractCdTarget(command, cwd) {
   const re = new RegExp(CD_RE.source, "gm");
   let last = null;
@@ -621,13 +656,28 @@ export function extractCdTarget(command, cwd) {
   if (!last) return null;
   let target = last;
   if (target.startsWith("~")) target = target.replace(/^~/, process.env.HOME || process.env.USERPROFILE || "~");
-  target = msysToWinPath(target);
-  if (!path.isAbsolute(target)) target = path.join(String(cwd), target);
-  target = path.resolve(target);
   // 语义对齐真实 bash：cd 到不存在的目录会失败并停留在原 cwd，后续命令仍在原目录
   // 执行。解析出不存在的目标应视为"无有效 cd"，而不是拿垃圾路径当工作目录。
-  if (!fs.existsSync(target)) return null;
-  return target;
+  return resolveCommandPath(target, command, cwd);
+}
+
+// git -C <path> 目标提取（v0.4.2）：取最后一次出现的 `git -C <path>`。
+// 背景：git 语境（分支/是否在副本内）此前只看 cd/会话 cwd，忽略 `git -C` 目标——
+// 绑定态下 `git -C <worktree> merge ...` 会在主 checkout 语境误判为"受保护分支上
+// merge"而误拦（反馈症状③）。-C 是最特异的 git 语境指示，优先于 cd。
+// 裸词捕获允许 $VAR/${VAR}（交由 resolveShellVars 解析），排除 ( 防 $(cmd) 命令替换。
+const GIT_C_RE = /(?:^|[;&|(\n]\s*)git\s+[^;&|]*?-C\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|`()]+))/g;
+
+export function extractGitCTarget(command, baseCwd) {
+  let last = null;
+  let m;
+  const re = new RegExp(GIT_C_RE.source, "g");
+  while ((m = re.exec(command)) !== null) {
+    last = m[1] || m[2] || m[3];
+  }
+  if (!last) return null;
+  // 目标不存在（含无法解析的 $VAR 动态路径）→ null，语境回退到 cd/cwd
+  return resolveCommandPath(last, command, baseCwd);
 }
 
 // ---------------------------------------------------------------------------

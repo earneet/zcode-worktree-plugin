@@ -324,6 +324,8 @@ const GIT_CHECKOUT_RE = /\bgit\s+(checkout|switch)\s+([^\s;|&..."<>()-]...)/i
 
 > **v0.4.1 后记**：同一个 session 来源错位也曾打到 `bindings/` 本身——v0.4.0 移除 state.json 兜底后，enter 写入的绑定（`cli-manual`）对 hook（payload 真实 `sess_*`）永远不可见，造成线上回归（重写失效 + 跨副本误拦）。v0.4.1 的修复不是把 bindings 也降级为仓库级，而是**由 guard_hook 对调用 wt.mjs 的 Bash 命令注入 `export ZCODE_SESSION_ID=<id>; ` 前缀**（updatedInput），让身份随进程环境传递——per-session 语义与 DB 继承全部保留。allowlist 保持仓库级不动（逃生口本来就是仓库语义）。
 
+> **v0.4.2 后记（Bash 语义差异）**：zcode 的 Bash 工具每次调用全新 shell（变量不保留）但**工作目录跨调用持久**（引擎 `pwd -P` 捕获机制，exit 0 且在 workspace 内才生效）——opencode 单进程会话内两者通常都保留。这决定了 worktree 插件在 zcode 侧的教学口径：进副本用单条字面量 `cd`（跨调用变量间接必失效），bash 内用相对路径；`git -C <path>` 的语境由 hook 显式解析（v0.4.2），而 opencode 无需此层。
+
 ---
 
 ## 5. 继承机制对比

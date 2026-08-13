@@ -16,6 +16,7 @@
 //   I  SessionStart hook 4 分支
 //   K  鲁棒性 / 边界
 //   N  会话身份贯通（v0.4.1 回归锁）+ Read 去武器化 + MSYS 路径/分支误报
+//   O  git -C 语境解析（v0.4.2 反馈③）+ TTL 本地显示 + exit 容错 + 拦截文案
 
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -1860,5 +1861,139 @@ describe("N. 会话身份贯通 + Read 去武器化 + MSYS 路径", () => {
     } finally {
       cleanupRepo(repo2);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// O. git -C 语境解析（v0.4.2 反馈③）+ TTL 本地显示 + exit 容错 + 拦截文案
+//
+// 背景（外部反馈症状③）：绑定态下 `git -C <worktree> merge ...` 此前按主 checkout
+// 语境求值分支（master）→ 误判为"受保护分支上 merge"而拦截，副本内的 git 闭环
+// （改码 → 提交 → 编译 → 测试）走不通。v0.4.2：hook 按 `git -C` 目标求值语境；
+// 同命令内 `VAR=...` 赋值可解析 `$VAR` 形态的目标（反馈实发命令即此形态）。
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("O. git -C 语境解析 + v0.4.2 修复", () => {
+  let repo, common, sid, wtPath, otherWt;
+
+  before(() => {
+    repo = makeRepo();
+    common = repoCommon(repo);
+    sid = "sess_o_bound";
+    runWt("create", { task_name: "feat" }, { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+    wtPath = path.join(repo, ".worktrees", "worktree-feat");
+    runWt("create", { task_name: "other" }, { env: { ZCODE_SESSION_ID: "sess_o_maker" }, cwd: repo });
+    otherWt = path.join(repo, ".worktrees", "worktree-other");
+    // 反馈者的命令形态：合并一个【无 worktree- 前缀】的分支
+    spawnSync("git", ["branch", "fix-demo"], { cwd: repo, encoding: "utf8" });
+  });
+  after(() => cleanupRepo(repo));
+
+  // --- 端到端：git -C 语境（反馈③复现） ---
+
+  it("O01: 🔴 绑定态 git -C <WT> merge --ff-only <非worktree前缀分支> → 放行（反馈③）", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: `git -C "${wtPath}" merge --ff-only fix-demo` },
+    });
+    assertPass(r);
+  });
+
+  it("O02: 绑定态 git -C <WT> merge master（同步基线）→ 放行", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: `git -C "${wtPath}" merge master` },
+    });
+    assertPass(r);
+  });
+
+  it("O03: 绑定态 git -C <主checkout> merge → 仍拦截（-C 指向主副本时语境正确）", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: `git -C "${repo}" merge fix-demo` },
+    });
+    assertBlock(r, "受保护分支");
+  });
+
+  it("O04: git -C <WT> checkout master → 仍拦截（防副本被劫持到受保护分支）", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: `git -C "${wtPath}" checkout master` },
+    });
+    assertBlock(r, "checkout");
+  });
+
+  it("O05: 绑定态 同命令变量形式 git -C \"$WT\" merge（反馈实发形态）→ 放行", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: sid,
+      tool_input: { command: `WT="${wtPath}"\ngit -C "$WT" merge --ff-only fix-demo` },
+    });
+    assertPass(r);
+  });
+
+  // --- extractGitCTarget 单元 ---
+
+  it("O06: extractGitCTarget 解析形态（字面量/引号/裸词/相对/-c 前缀/链式取最后/无-C）", () => {
+    const d1 = fs.mkdtempSync(path.join(os.tmpdir(), "wtg-ogc1-"));
+    const d2 = fs.mkdtempSync(path.join(os.tmpdir(), "wtg-ogc2-"));
+    const rel = path.join(d1, "relsub");
+    fs.mkdirSync(rel, { recursive: true });
+    const cur = "F:\\nonexistent-cur";
+    try {
+      assert.equal(C.extractGitCTarget(`git -C ${d2} status`, cur), path.resolve(d2), "裸词");
+      assert.equal(C.extractGitCTarget(`git -C "${d1}" status`, cur), path.resolve(d1), "双引号");
+      assert.equal(C.extractGitCTarget(`git -C '${d1}' status`, cur), path.resolve(d1), "单引号");
+      assert.equal(C.extractGitCTarget(`git -C relsub status`, d1), path.resolve(rel), "相对路径基于 baseCwd");
+      assert.equal(C.extractGitCTarget(`git -c a=b -C "${d1}" status`, cur), path.resolve(d1), "-c 前缀后 -C");
+      assert.equal(C.extractGitCTarget(`git -C "${d1}" a; git -C "${d2}" b`, cur), path.resolve(d2), "链式取最后");
+      assert.equal(C.extractGitCTarget(`git status`, cur), null, "无 -C");
+      assert.equal(C.extractGitCTarget(`git -C "F:\\no\\such\\dir" status`, cur), null, "不存在 → null");
+      assert.equal(C.extractGitCTarget(`git -C $NOPE status`, cur), null, "未赋值 $VAR → null");
+      // cd 与 -C 组合：-C 相对路径应基于 cd 后语境（模拟 guard_hook 的两级解析）
+      const cdT = C.extractCdTarget(`cd "${d1}" && git -C relsub status`, cur);
+      assert.equal(C.extractGitCTarget(`cd "${d1}" && git -C relsub status`, cdT || cur), path.resolve(rel), "cd 后相对 -C");
+    } finally {
+      fs.rmSync(d1, { recursive: true, force: true });
+      fs.rmSync(d2, { recursive: true, force: true });
+    }
+  });
+
+  // --- TTL 本地显示（反馈④） ---
+
+  it("O07: allow 输出显示本地时间与分钟数（不再裸 UTC ISO 串）", () => {
+    const r = runWt("allow", { action: "add", path: "docs/tmp-o07.md", reason: "测试" }, { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+    const content = wtContent(r);
+    assert.ok(content.includes("本地时间"), `应标注本地时间: ${content.slice(0, 300)}`);
+    assert.ok(content.includes("60 分钟"), `应显示时长: ${content.slice(0, 300)}`);
+    assert.ok(!/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(content), `不应再输出裸 UTC ISO: ${content.slice(0, 300)}`);
+    runWt("allow", { action: "clear" }, { env: { ZCODE_SESSION_ID: sid }, cwd: repo });
+  });
+
+  // --- exit(remove) 半成功容错（live 验证发现的 Windows 边缘） ---
+
+  it("O08: exit(remove) 遇 is not a working tree → 视为已注销，清绑定不卡死", () => {
+    const sid2 = "sess_o08";
+    runWt("create", { task_name: "halfgone" }, { env: { ZCODE_SESSION_ID: sid2 }, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-halfgone" }, { env: { ZCODE_SESSION_ID: sid2 }, cwd: repo });
+    // 模拟首次 remove 半成功：git 已注销（直接 spawn 强删目录+注销）
+    spawnSync("git", ["worktree", "remove", "--force", path.join(repo, ".worktrees", "worktree-halfgone")],
+      { cwd: repo, encoding: "utf8" });
+    // 此时 exit(remove) 重试 → "is not a working tree" → 容错继续
+    const r = runWt("exit", { action: "remove", confirm_remove: true }, { env: { ZCODE_SESSION_ID: sid2 }, cwd: repo });
+    const content = wtContent(r);
+    assert.ok(!content.includes("❌"), `不应失败: ${content.slice(0, 300)}`);
+    assert.ok(content.includes("副本已不在 git 注册表"), `应提示已注销: ${content.slice(0, 300)}`);
+    assert.equal(C.loadBinding(common, sid2), null, "绑定应已清除");
+  });
+
+  // --- 跨副本拦截文案（反馈③体验） ---
+
+  it("O09: 跨副本写拦截文案包含 enter 指引", () => {
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: sid,
+      tool_input: { file_path: path.join(otherWt, "z.js"), content: "z" },
+    });
+    assertBlock(r, "进入该副本");
   });
 });

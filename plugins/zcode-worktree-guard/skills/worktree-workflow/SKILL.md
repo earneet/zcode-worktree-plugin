@@ -49,8 +49,31 @@ ls "<base>/../../scripts/wt.mjs"   # 应输出该文件路径
 
 所以：**照常写主 checkout 的路径即可，hook 替你重定向。** 这正是"无路径漂移"的保证。
 
-唯一例外：`Bash` 工具的工作目录无法被重写（ZCode 限制）。所以 Bash 里的文件操作要自己注意路径；
-但更推荐——用 `Write`/`Edit` 工具写文件（会自动重写），少用 `echo > file` 这类 bash 重定向。
+唯一例外：`Bash` 工具。bash 命令字符串无法被安全重写，所以 Bash 里的路径语义要自己掌握：
+
+### Bash 工作流（enter 之后跑 git / 编译 / 测试的正确姿势）
+
+**ZCode Bash 语义（引擎实测）：**
+- **每次调用都是全新 shell**——你在调用里 `export`/`VAR=...` 的变量**不会保留**到下一次调用
+  （`WT="..."; ...` 然后下一次 `cd "$WT"` 会因 `$WT` 为空而无效，且不报错）。
+- **工作目录跨调用持久**——命令成功（exit 0）且落在仓库内时，ZCode 会捕获新目录并延续到后续调用。
+
+**因此要在副本内跑命令（git 提交、gradle 编译、跑测试）：**
+```bash
+# 第一条：单条、直接字面量路径 cd 进副本（会话工作目录随之持久切换）
+cd "<worktree 绝对路径>"
+
+# 之后所有调用自然都在副本内，用相对路径：
+git add -A && git commit -m "..."
+./gradlew build
+echo x > scene/s.txt        # 相对路径 → 落在副本内 ✓
+```
+- 不要用变量间接（`WT=...` 跨调用必失效）；要么一条命令内完成，要么用字面量路径。
+- 单条 git 操作也可用 `git -C "<worktree>" <cmd>`——hook 会按 `-C` 目标判定语境
+  （副本内的 `merge master` 同步基线等合法操作放行）。
+- **警示**：bash 里写**绝对主 checkout 路径**（`> <MAIN>/f.txt`、`sed -i <MAIN>/x`）
+  不会被重写，会直接改到主副本——要写文件用 `Write`/`Edit` 工具（自动重写），
+  bash 内只用副本相对路径。
 
 **若被 hook 拦截**（写错位置或危险操作），拦截消息里会给出 `node <绝对路径> wt.mjs` 的完整命令——
 可直接复用，无需自己拼脚本路径。
@@ -120,8 +143,10 @@ worktree、又想例外写主 checkout 某路径（绕过重写），才用逃�
 2. **创建副本后**：`enter` 登记为本会话绑定，路径透明重写才生效。
 
 3. **在副本内工作**：
-   - **直接用 Write/Edit 写主 checkout 的路径即可**，hook 自动重写到 worktree；
-   - 不要主动加 worktree 前缀，也不要 cd 进 worktree——保持路径自然，hook 处理一切。
+   - **写文件：直接用 Write/Edit 写主 checkout 的路径即可**，hook 自动重写到 worktree；
+     不要主动加 worktree 前缀——保持路径自然，hook 处理一切。
+   - **跑命令（git/编译/测试）：按上面「Bash 工作流」**，先单条 `cd "<worktree 绝对路径>"`
+     或用 `git -C`，bash 内只用相对路径。
 
 4. **任务结束时**：`exit(action="keep")` 汇报状态，**等待用户授权合并**。
    - 不要自行 `git merge` / `git rebase` 到主分支（绑定态会被 hook 拦截）。
@@ -160,7 +185,7 @@ worktree、又想例外写主 checkout 某路径（绕过重写），才用逃�
 | `authorize-main` 授权期间 | ✅ 全部放行（`.git` 仍拦） |
 | 仓库外路径、非 git 目录 | ✅ 放行 |
 
-已知边界：hook 是 fail-open（脚本异常放行）；Bash 工作目录无法被重写，只拦危险 git 操作。
+已知边界：hook 是 fail-open（脚本异常放行）；bash 命令字符串不被重写（Bash 内用副本相对路径或先 cd，见「Bash 工作流」），只拦危险 git 操作。
 
 ## 与纪律的对照表
 

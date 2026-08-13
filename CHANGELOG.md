@@ -2,6 +2,56 @@
 
 本文件记录 zcode-worktree-guard 的版本演进。详细设计见 [docs/design.md](docs/design.md)。
 
+## [0.4.2] — 2026-08-13
+
+### 修复：`git -C <path>` 语境被忽略 → 副本内 git 闭环误拦（外部反馈③）
+
+外部 agent 在 v0.4.1 上反馈：绑定态 `git -C <worktree> merge --ff-only <分支>` 被拦截，
+副本内的"改码 → git 提交 → 编译 → 测试"闭环走不通。根因：`guard_hook` 的 Bash 分支求值
+分支/是否在副本内时只看 `cd`/会话 cwd，**完全忽略 `git -C <path>` 目标**——该命令在主
+checkout 语境下求值出"master + 有绑定"→ 误判为"受保护分支上 merge"而拦截。
+
+**修复**：新增 `extractGitCTarget()`（取最后一次 `git -C <path>`，引号/裸词/`-c` 前缀/
+链式取最后；相对路径基于 cd 后语境；MSYS 归一化；目标不存在 → null 回退），Bash 分支
+语境优先级变为 **`git -C` > `cd` > 会话 cwd**。效果：`git -C <WT> merge master`（同步
+基线）放行；`git -C <主checkout> merge` 仍拦；`git -C <WT> checkout master` 仍拦
+（防副本被劫持到受保护分支）。
+
+**同命令 shell 变量解析**：ZCode Bash 每次调用都是全新 shell，跨调用变量不保留；反馈
+实发命令形态为同一命令内 `WT="<路径>"` 赋值 + `git -C "$WT"`。新增窄作用域解析器
+（收集 `NAME=值` 赋值，替换 `$NAME`/`${NAME}`，仅用于 cd/-C 目标提取，不执行任何东西），
+该实发形态现已正确放行。
+
+### 反馈①②定位为语义教学缺口（非代码缺陷），已补齐文档与提示
+
+引擎源码核实（zcode.cjs）：ZCode Bash **每次调用全新 shell**（env/变量不保留，仅 profile
+别名重放），但**工作目录跨调用持久**（命令 exit 0 且落在 workspace 内时，引擎经 `pwd -P`
+捕获 → `setWorkingDirectory` 延续）。因此：
+
+- 症状②（`cd "$WT"` 后 `pwd` 仍是主副本）＝ `$WT` 变量跨调用丢失所致，非目录不持久；
+- 症状①（bash 重定向写主 checkout 不重写）＝ bash 命令字符串不做透明重写（设计边界，
+  shell 语法无法安全改写）。
+
+正确闭环姿势（已写入 session_start 锁定提示、SKILL.md「Bash 工作流」、README「Bash 行为
+与已知边界」）：单条 `cd "<worktree 绝对路径>"` 切入副本（会话目录随之持久切换），之后
+git/编译/测试用相对路径；单条 git 操作可用 `git -C`；**bash 里写绝对主 checkout 路径不会
+被重写**，写文件用 Write/Edit 工具。
+
+### 其他修复
+
+- **allow TTL 显示**（反馈④）：有效期输出从裸 UTC ISO 串（`2026-08-13T10:38:18.768Z`，
+  对照本地时钟像"秒过期"）改为本地时间 + 时长（`约 60 分钟`）；`allow list` 同步。
+- **跨副本拦截文案**：追加可操作指引「若要在此副本内工作，先用 wt.mjs enter 进入该副本」。
+- **exit(remove) 半成功容错**（v0.4.1 live 验证发现的 Windows 边缘）：remove 可能半成功
+  （git 已注销、目录删除 EPERM），重试报 "is not a working tree" 原先会卡死退出流程；
+  现视为已注销，继续清绑定并提示手动清理残留目录。
+
+### 测试
+
+`tests/v2.test.mjs` 新增 O 组 9 用例：O01/O05 为反馈③复现（字面量与 `$VAR` 实发形态，
+先红后绿）、O02-O04 语境正确性三向验证、O06 `extractGitCTarget` 八形态单元、O07 TTL
+本地显示、O08 exit 容错、O09 文案指引。全量 **157 用例全绿**（148 既有零翻转）。
+
 ## [0.4.1] — 2026-08-13
 
 ### 🔴 修复 v0.4.0 线上回归：绑定永远解析失败（会话身份错位）

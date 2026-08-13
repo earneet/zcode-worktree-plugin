@@ -215,11 +215,30 @@ ZCode 只把 `session_id` 放进 hook 的 stdin payload，**不注入 Bash 工�
 终端手工调用 `wt.mjs`（无会话上下文）落到 `cli-manual` 兜底 id——该绑定对 ZCode 会话
 不可见，`wt.mjs status` 会明确提示。
 
+## Bash 行为与已知边界
+
+ZCode 的 Bash 工具语义（引擎实测）与文件工具不同，enter 绑定后请注意：
+
+| 事实 | 含义 |
+|---|---|
+| Bash 每次调用都是**全新 shell** | 调用内 `VAR=...`/`export` 的变量**不跨调用保留**（`cd "$WT"` 跨调用会因变量为空而静默失效） |
+| **工作目录跨调用持久**（命令 exit 0 且落在仓库内） | 单条 `cd "<worktree 绝对路径>"` 即把会话目录切进副本，之后 git/编译/测试用相对路径自然落在副本内 |
+| bash 命令字符串**不做透明重写** | `> <主checkout绝对路径>/f.txt`、`sed -i <主checkout>/x` 会直改主副本——bash 内只用副本相对路径；写文件优先用 Write/Edit 工具（自动重写） |
+| `git -C <path>` 语境被正确识别（v0.4.2） | `git -C <worktree> merge master`（同步基线）等副本内合法操作放行；危险操作仍按 `-C` 目标语境拦截 |
+
+在副本内完成"改代码 → git 提交 → 编译 → 测试"闭环的推荐姿势：
+
+```bash
+cd "<worktree 绝对路径>"     # 单条调用；会话工作目录随之持久切换
+git add -A && git commit -m "..."
+./gradlew build              # 或 npm test / make 等，相对路径即可
+```
+
 ## 设计与实现
 
 - **[docs/design.md](docs/design.md)** — 完整设计文档：契约证据（PreToolUse 改写能力的实测验证）、架构决策、审计修正记录、已知边界
 - 纯 Node.js ESM（`.mjs`），与 ZCode 同栈，零运行时依赖
-- **148 个自动化测试用例**（`node --test tests/v2.test.mjs`）：覆盖决策表、Bash 拦截、绑定三层降级、白名单、allowlist、生命周期、SessionStart、会话身份注入端到端（N 组）等全部子系统
+- **157 个自动化测试用例**（`node --test tests/v2.test.mjs`）：覆盖决策表、Bash 拦截、绑定三层降级、白名单、allowlist、生命周期、SessionStart、会话身份注入端到端（N 组）、`git -C` 语境解析（O 组）等全部子系统
 
 ## License
 

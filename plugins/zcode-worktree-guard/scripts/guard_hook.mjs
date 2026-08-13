@@ -118,7 +118,10 @@ function decideWrite(target, ctx, isWrite) {
   // 6. 跨副本写入保护（始终生效，不论有无绑定；写拒绝，读放行——见 crossWorktreeDeny 注释）
   if (crossWorktreeDeny(nTarget, ctx)) {
     if (isWrite) {
-      return { action: "deny", reason: "目标路径在其他 worktree 副本内，不允许跨副本写入。" };
+      return {
+        action: "deny",
+        reason: "目标路径在其他 worktree 副本内，不允许跨副本写入。若要在此副本内工作，先用 wt.mjs enter 进入该副本；若目标本就该是当前副本，请核对路径。",
+      };
     }
     return { action: "allow", source: "read-cross-worktree" };
   }
@@ -267,8 +270,14 @@ async function main() {
   // 定位 git 上下文
   let common, root, branch, inWt;
   if (toolName === "Bash") {
-    const cdTarget = C.extractCdTarget(toolInput.command || "", cwd);
-    const effectiveCwd = cdTarget || cwd;
+    const command = toolInput.command || "";
+    const cdTarget = C.extractCdTarget(command, cwd);
+    // v0.4.2：git -C <path> 是最特异的 git 语境指示（优先于 cd/会话 cwd）。
+    // 此前忽略它导致绑定态 `git -C <worktree> merge ...` 在主 checkout 语境下被误判
+    // 为"受保护分支上 merge"而误拦（反馈症状③）。-C 目标不可解析（动态 $VAR 解析失败
+    // /路径不存在）时回退 cd/cwd 语境。
+    const gitCTarget = C.extractGitCTarget(command, cdTarget || cwd);
+    const effectiveCwd = gitCTarget || cdTarget || cwd;
     ({ common, root } = C.findGitContextForCwd(effectiveCwd));
     branch = C.currentBranch(effectiveCwd);
     inWt = C.inLinkedWorktree(effectiveCwd);
