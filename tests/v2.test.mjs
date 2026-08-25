@@ -2253,7 +2253,8 @@ describe("P. v0.4.4 remove / TTL / 拦截文案", () => {
     assertBlock(r);
     const err = r.stderr;
     assert.ok(err.includes("delete_branch"), `应含 exit(delete_branch): ${err.slice(0, 300)}`);
-    assert.ok(err.includes("remove"), `应含 remove 指引: ${err.slice(0, 400)}`);
+    // 收紧："<worktree路径>" 占位符只出现在 remove 解法命令行里（footer 只列子命令名）
+    assert.ok(err.includes("\"path\":\"<worktree路径>\""), `应含 remove 命令行: ${err.slice(0, 400)}`);
   });
 
   it("P17: 跨副本写拦截文案——enter 指引 + 可复制 enter 命令", () => {
@@ -2265,5 +2266,53 @@ describe("P. v0.4.4 remove / TTL / 拦截文案", () => {
     });
     assertBlock(r, "进入该副本");
     assert.ok(r.stderr.includes("enter"), `解法应含 enter 命令: ${r.stderr.slice(0, 300)}`);
+  });
+
+  // --- v0.4.4 审查修复回归 ---
+
+  it("P18: exit(keep) 回执的 remove 示例是合法 JSON（Windows 反斜杠路径回归锁）", () => {
+    const sid = "sess_p18";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "p18-receipt" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-p18-receipt" }, { env, cwd: repo });
+    const er = runWt("exit", { action: "keep" }, { env, cwd: repo });
+    const c = wtContent(er);
+    const m = c.match(/\{"path":[^\n]*?"delete_branch":true\}/);
+    assert.ok(m, `回执应含 remove JSON 示例: ${c.slice(-300)}`);
+    let parsed;
+    try { parsed = JSON.parse(m[0]); }
+    catch (e) { assert.fail(`回执示例不是合法 JSON（照抄即"缺少 path 参数"）: ${m[0]} (${e.message})`); }
+    assert.equal(parsed.confirm_remove, true);
+    assert.equal(parsed.delete_branch, true);
+    assert.ok(parsed.path && !parsed.path.includes("\\"), `示例路径应为正斜杠相对路径: ${parsed.path}`);
+  });
+
+  it("P19: remove 路径安全——主 checkout 本身与仓库外路径均拒绝", () => {
+    // path="." → 解析为主 checkout → 非注册副本、无同名分支 → 拒绝
+    const rRoot = runWt("remove", { path: ".", confirm_remove: true, delete_branch: true }, { cwd: repo });
+    assert.ok(wtContent(rRoot).includes("❌"), `主 checkout 应拒绝: ${wtContent(rRoot).slice(0, 200)}`);
+    // 仓库外绝对路径 → 分支残留形态的仓库内约束 → 拒绝
+    const outside = path.join(os.tmpdir(), "wtg-outside-" + Date.now(), "worktree-fake");
+    const rOut = runWt("remove", { path: outside, confirm_remove: true, delete_branch: true }, { cwd: repo });
+    assert.ok(wtContent(rOut).includes("不在本仓库内"), `仓库外应拒绝: ${wtContent(rOut).slice(0, 200)}`);
+  });
+
+  it("P20: remove 形态② 未合并分支 → -d 拒删、分支保留", () => {
+    const sid = "sess_p20";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "p20-left" }, { env, cwd: repo });
+    const wt = path.join(repo, ".worktrees", "worktree-p20-left");
+    spawnSync("git", ["commit", "-q", "--allow-empty", "-m", "w"], { cwd: wt, encoding: "utf8" });
+    runWt("exit", { action: "keep" }, { env, cwd: repo });
+    spawnSync("git", ["worktree", "remove", wt], { cwd: repo, encoding: "utf8" });
+    const r = runWt("remove", { path: ".worktrees/worktree-p20-left", confirm_remove: true, delete_branch: true },
+      { cwd: repo });
+    const c = wtContent(r);
+    assert.ok(c.includes("仅做分支清理"), `应提示分支残留模式: ${c.slice(0, 300)}`);
+    assert.ok(c.includes("保留"), `未合并分支应保留: ${c.slice(0, 300)}`);
+    const br = spawnSync("git", ["branch", "--list", "worktree-p20-left"], { cwd: repo, encoding: "utf8" });
+    assert.ok((br.stdout || "").includes("worktree-p20-left"), "未合并分支应保留");
+    // 清理：测试进程直删（不经 hook）
+    spawnSync("git", ["branch", "-D", "worktree-p20-left"], { cwd: repo, encoding: "utf8" });
   });
 });
