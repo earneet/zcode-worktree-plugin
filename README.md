@@ -114,11 +114,16 @@ echo '{"reason": "用户授权合并 fix-login"}' | node <plugin>/scripts/wt.mjs
 # git merge worktree-fix-login …
 echo '{}' | node <plugin>/scripts/wt.mjs revoke-main
 
-# 收尾：删副本目录 + 清理已合并分支（git branch -d 仅删已合并；未合并则保留分支）
+# 收尾方式一（绑定中一步收尾）：删副本目录 + 清理已合并分支（git branch -d 仅删已合并；未合并则保留分支）
 echo '{"action": "remove", "confirm_remove": true, "delete_branch": true}' | node <plugin>/scripts/wt.mjs exit
+
+# 收尾方式二（已 exit 后再合并——exit-first 流）：remove 子命令，无需活动绑定
+echo '{"path": ".worktrees/worktree-fix-login", "confirm_remove": true, "delete_branch": true}' | node <plugin>/scripts/wt.mjs remove
 ```
 
 > `task_name` 必须是小写字母/数字/连字符的 slug（如 `fix-login`），不接受大写/下划线/空格/中文。
+>
+> `authorize-main` 授权默认 **15 分钟自动失效**（`ttl_minutes` 可调），到期后恢复拦截——revoke 不再只靠自觉。
 
 ## 拦截规则一览
 

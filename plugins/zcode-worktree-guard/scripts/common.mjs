@@ -312,20 +312,38 @@ export function clearStateByCommon(common) {
 }
 
 // 全局授权（authorize-main）：写入 state.json 的 allow_main_writes 字段（原 override.json 废弃）
+// v0.4.4 TTL（外部反馈：revoke 靠自觉，忘了授权就无限期裸奔）：授权自带过期时间，
+// 到期 loadGlobalAllow 自动判负。旧版本写入的（无 allow_expires_at）按已过期处理（收紧方向）。
+export const AUTH_DEFAULT_TTL_MIN = 15;
+
+function globalAllowExpired(s) {
+  if (!s.allow_expires_at) return true; // 无 TTL 视为过期（安全侧）
+  return new Date(s.allow_expires_at).getTime() <= Date.now();
+}
+
 export function loadGlobalAllow(common) {
   const s = readJson(stateFile(common));
-  return !!(s && s.allow_main_writes);
+  return !!(s && s.allow_main_writes && !globalAllowExpired(s));
 }
-export function setGlobalAllow(common, reason) {
+
+// 未过期的到期时刻（ISO），无有效授权返回 null——供 status/输出显示。
+export function globalAllowExpiry(common) {
+  const s = readJson(stateFile(common));
+  if (!s || !s.allow_main_writes || globalAllowExpired(s)) return null;
+  return s.allow_expires_at || null;
+}
+
+export function setGlobalAllow(common, reason, ttlMinutes = AUTH_DEFAULT_TTL_MIN) {
   const s = readJson(stateFile(common)) || {};
   s.allow_main_writes = true;
   s.allow_reason = reason || "用户授权";
   s.allow_at = nowIso();
+  s.allow_expires_at = new Date(Date.now() + ttlMinutes * 60000).toISOString();
   writeJson(stateFile(common), s);
 }
 export function clearGlobalAllow(common) {
   const s = readJson(stateFile(common));
-  if (s) { delete s.allow_main_writes; delete s.allow_reason; delete s.allow_at; writeJson(stateFile(common), s); }
+  if (s) { delete s.allow_main_writes; delete s.allow_reason; delete s.allow_at; delete s.allow_expires_at; writeJson(stateFile(common), s); }
 }
 
 // ---------------------------------------------------------------------------

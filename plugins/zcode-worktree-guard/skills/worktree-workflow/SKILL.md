@@ -112,7 +112,10 @@ echo '{"action": "remove", "confirm_remove": true}' | node "<WT>" exit
 # 删副本 + 清理已合并分支（合并后收尾：git branch -d 仅删已合并分支，未合并则保留）
 echo '{"action": "remove", "confirm_remove": true, "delete_branch": true}' | node "<WT>" exit
 
-# 授权在主 checkout 上修改/合并（需用户明确授权后才可调用）
+# remove 子命令（已 exit 之后的收尾，无需活动绑定；目录已被手动删时也可只清分支残留）
+echo '{"path": ".worktrees/worktree-add-drop-module", "confirm_remove": true, "delete_branch": true}' | node "<WT>" remove
+
+# 授权在主 checkout 上修改/合并（需用户明确授权后才可调用；默认 15 分钟自动失效，ttl_minutes 可调）
 echo '{"reason": "用户授权合并 worktree-add-drop-module"}' | node "<WT>" authorize-main
 
 # 撤销授权（授权操作完成后立即执行）
@@ -155,14 +158,18 @@ worktree、又想例外写主 checkout 某路径（绕过重写），才用逃�
    - 不要自行 `git merge` / `git rebase` 到主分支（绑定态会被 hook 拦截）。
    - 报告口径：`worktree <name> 已就绪，待您确认是否合并`。
 
-5. **合并 worktree 到主分支**（用户明确说"合并"后）：
-   - 分**三次独立的 Bash 调用**执行（切勿合并到同一命令！）：
-     1. `authorize-main` 记录授权原因；
+5. **合并 worktree 到主分支**（用户明确说"合并"后），两种合法路径：
+   - **路径 A（绑定中合并）**：分**三次独立的 Bash 调用**执行（切勿合并到同一命令！）：
+     1. `authorize-main` 记录授权原因（默认 15 分钟自动失效）；
      2. `git merge worktree-<task>` 执行合并；
      3. `revoke-main` 立即撤销授权。
-   - **为什么必须分开**：hook 在命令执行**前**做静态扫描，若 authorize 与 git merge 写在同一命令里，
-     authorize 的授权还没生效，merge 就会被拦截。分三次调用确保授权先落盘、再放行操作。
-   - 合并经用户确认后，用 `exit(action="remove", confirm_remove=true, delete_branch=true)` 收尾：删副本目录 + 清理已合并分支（`git branch -d` 仅删已合并，未合并会保留并提示）。
+     - **为什么必须分开**：hook 在命令执行**前**做静态扫描，若 authorize 与 git merge 写在同一命令里，
+       authorize 的授权还没生效，merge 就会被拦截。分三次调用确保授权先落盘、再放行操作。
+   - **路径 B（exit-first，无需授权合并）**：先 `exit(action="keep")` 退出绑定 →
+     主副本默认开放，直接 `git merge worktree-<task>`（本地 merge 放行）。
+   - **收尾（两路径通用）**：绑定中用 `exit(action="remove", confirm_remove=true, delete_branch=true)`；
+     已退出用 `remove` 子命令 `{"path": ".worktrees/worktree-<task>", "confirm_remove": true, "delete_branch": true}`。
+     均为：删副本目录 + 清理已合并分支（`git branch -d` 仅删已合并，未合并会保留并提示）。
 
 6. **不进 worktree、直接改主 checkout**（最常见情况）：
    - 默认就是允许的，直接用 Write/Edit/git 操作即可，无需任何授权。
