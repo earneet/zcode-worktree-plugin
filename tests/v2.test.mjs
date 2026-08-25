@@ -1270,6 +1270,56 @@ describe("H. wt.mjs 生命周期子命令", () => {
       { env: { ZCODE_SESSION_ID: "sess_a" }, cwd: repo });
     assertWtFail(r, "其他会话");
   });
+
+  // --- v0.4.3：exit delete_branch（合并后收尾正规路径，反馈驱动） ---
+
+  it("H12: exit(remove, delete_branch=true) 分支已合并 → 删目录 + 删分支", () => {
+    runWt("create", { task_name: "merged-feature" }, { cwd: repo });
+    const env = { ZCODE_SESSION_ID: "sess_h12" };
+    runWt("enter", { path: ".worktrees/worktree-merged-feature" }, { env, cwd: repo });
+    const wtDir = path.join(repo, ".worktrees", "worktree-merged-feature");
+    // 副本内提交一个改动，再在主 checkout 合并
+    fs.writeFileSync(path.join(wtDir, "feat.txt"), "x");
+    spawnSync("git", ["add", "."], { cwd: wtDir, encoding: "utf8" });
+    spawnSync("git", ["commit", "-q", "-m", "feat"], { cwd: wtDir, encoding: "utf8" });
+    spawnSync("git", ["merge", "-q", "worktree-merged-feature"], { cwd: repo, encoding: "utf8" });
+    const r = runWt("exit", { action: "remove", confirm_remove: true, delete_branch: true }, { env, cwd: repo });
+    const content = wtContent(r);
+    assertWtOk(r, "已删除");
+    assert.ok(content.includes("分支 worktree-merged-feature 已删除"), `应提示分支已删: ${content.slice(0, 300)}`);
+    assert.ok(!fs.existsSync(wtDir), "目录应已删除");
+    const br = spawnSync("git", ["branch", "--list", "worktree-merged-feature"], { cwd: repo, encoding: "utf8" });
+    assert.equal(br.stdout.trim(), "", "分支应已删除");
+  });
+
+  it("H13: exit(remove, delete_branch=true) 分支未合并 → 删目录，保留分支", () => {
+    runWt("create", { task_name: "unmerged-feature" }, { cwd: repo });
+    const env = { ZCODE_SESSION_ID: "sess_h13" };
+    runWt("enter", { path: ".worktrees/worktree-unmerged-feature" }, { env, cwd: repo });
+    const wtDir = path.join(repo, ".worktrees", "worktree-unmerged-feature");
+    // 副本内提交，但不合并到 master
+    fs.writeFileSync(path.join(wtDir, "feat.txt"), "y");
+    spawnSync("git", ["add", "."], { cwd: wtDir, encoding: "utf8" });
+    spawnSync("git", ["commit", "-q", "-m", "feat2"], { cwd: wtDir, encoding: "utf8" });
+    const r = runWt("exit", { action: "remove", confirm_remove: true, delete_branch: true }, { env, cwd: repo });
+    const content = wtContent(r);
+    assertWtOk(r, "已删除");
+    assert.ok(content.includes("保留"), `应提示分支保留（未合并）: ${content.slice(0, 300)}`);
+    assert.ok(!fs.existsSync(wtDir), "目录应已删除");
+    const br = spawnSync("git", ["branch", "--list", "worktree-unmerged-feature"], { cwd: repo, encoding: "utf8" });
+    assert.ok(br.stdout.includes("worktree-unmerged-feature"), "未合并分支应保留");
+  });
+
+  it("H14: exit(keep, delete_branch=true) → 提示已忽略，目录保留", () => {
+    runWt("create", { task_name: "keep-ignore" }, { cwd: repo });
+    const env = { ZCODE_SESSION_ID: "sess_h14" };
+    runWt("enter", { path: ".worktrees/worktree-keep-ignore" }, { env, cwd: repo });
+    const r = runWt("exit", { action: "keep", delete_branch: true }, { env, cwd: repo });
+    const content = wtContent(r);
+    assertWtOk(r, "已忽略");
+    assert.ok(content.includes("delete_branch 仅在 action=remove"), `应提示已忽略: ${content.slice(0, 300)}`);
+    assert.ok(fs.existsSync(path.join(repo, ".worktrees", "worktree-keep-ignore")), "keep 模式目录应保留");
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

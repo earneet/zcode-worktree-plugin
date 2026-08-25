@@ -52,7 +52,7 @@ function block(reason, ctx) {
     "修正方式（按需）:\n" +
     "1. 写主 checkout 一般是允许的（默认开放）——若你正持有 enter 绑定又想写主副本，先 exit 退出该会话绑定；\n" +
     "2. 跨副本/`.git` 写是硬拦截——确认目标路径正确；\n" +
-    "3. git push 到 master/main、删 worktree 分支需用户明确授权：echo '{\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" authorize-main；\n" +
+    "3. git push 到 master/main、删 worktree 分支需用户明确授权：echo '{\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" authorize-main；若该 worktree 分支已合并进主分支，也可用 exit(action='remove', confirm_remove=true, delete_branch=true) 在删副本时一并安全清理（git branch -d 仅删已合并）。\n" +
     "4. 需临时写主目录某文件（已绑定时）：echo '{\"action\":\"add\",\"path\":\"<相对路径>\",\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" allow；\n" +
     `（脚本: node "${WT_TOOL}" <create|enter|exit|allow|authorize-main|revoke-main>，stdin 传 JSON）\n`
   );

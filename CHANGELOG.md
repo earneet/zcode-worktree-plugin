@@ -2,6 +2,33 @@
 
 本文件记录 zcode-worktree-guard 的版本演进。详细设计见 [docs/design.md](docs/design.md)。
 
+## [0.4.3] — 2026-08-14
+
+### 新增：`exit` 的 `delete_branch` —— 合并后收尾的 agent 正规路径（外部反馈）
+
+外部用户反馈：合并完成的 worktree 收尾时，agent 删不掉分支——
+`exit(action="remove")` 只 `git worktree remove` **保留分支**；agent 跑 `git branch -d`
+又命中 `guard_hook` 的**无条件拦截**（`GIT_DEL_WORKTREE_RE`，安全网），只能卡在
+`authorize-main` 等用户手动。三个正确设计组合出一个空隙：合并后收尾没有 agent 可自走的路径。
+
+**修复**：`exit` 新增 `delete_branch` 参数（仅 `action="remove"` 生效）。`git worktree remove`
+成功后，在主 checkout 直跑 `git branch -d <branch>`（**非 `-D`**）。安全性由 `-d` 闸门保证——
+仅删**已合并进 HEAD** 的分支，未合并则 git 拒绝并提示保留，无需自定义合并判断。删分支在
+`wt.mjs` 进程内用 `runGit` 直跑，**不经 agent Bash**，故不触发 hook 拦截——这正是把删分支从
+"被拦的 agent 操作"迁移到"exit 内部的安全步骤"。
+
+```bash
+# 合并完成后一步收尾：删副本目录 + 清理已合并分支
+echo '{"action":"remove","confirm_remove":true,"delete_branch":true}' | node "<WT>" exit
+```
+
+**可发现性**：`guard_hook` 拦截 `git branch -d` 的提示补了 `exit(delete_branch)` 引导；
+`exit(action="keep")` 回执预告合并后的一步收尾命令；SessionStart 锁定态提示同补。
+
+**未改动**：`GIT_DEL_WORKTREE_RE` 拦截**保留**（agent 侧 `git branch -d` 仍是安全网）；
+建议3（`wt.mjs remove <path>` 事后清理子命令）暂不做——合并后 `exit(remove, delete_branch)`
+已闭环，新增子命令徒增维护面。
+
 ## [0.4.2] — 2026-08-13
 
 ### 修复：`git -C <path>` 语境被忽略 → 副本内 git 闭环误拦（外部反馈③）
