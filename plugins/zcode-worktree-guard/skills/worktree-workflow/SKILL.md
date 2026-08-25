@@ -109,6 +109,9 @@ echo '{"action": "keep"}' | node "<WT>" exit
 # 删除副本（需显式确认且工作区干净；只删目录，分支保留）
 echo '{"action": "remove", "confirm_remove": true}' | node "<WT>" exit
 
+# 删副本 + 清理已合并分支（合并后收尾：git branch -d 仅删已合并分支，未合并则保留）
+echo '{"action": "remove", "confirm_remove": true, "delete_branch": true}' | node "<WT>" exit
+
 # 授权在主 checkout 上修改/合并（需用户明确授权后才可调用）
 echo '{"reason": "用户授权合并 worktree-add-drop-module"}' | node "<WT>" authorize-main
 
@@ -159,7 +162,7 @@ worktree、又想例外写主 checkout 某路径（绕过重写），才用逃�
      3. `revoke-main` 立即撤销授权。
    - **为什么必须分开**：hook 在命令执行**前**做静态扫描，若 authorize 与 git merge 写在同一命令里，
      authorize 的授权还没生效，merge 就会被拦截。分三次调用确保授权先落盘、再放行操作。
-   - 合并经用户确认后，才可 `exit(action="remove")` 清理副本目录（分支保留）。
+   - 合并经用户确认后，用 `exit(action="remove", confirm_remove=true, delete_branch=true)` 收尾：删副本目录 + 清理已合并分支（`git branch -d` 仅删已合并，未合并会保留并提示）。
 
 6. **不进 worktree、直接改主 checkout**（最常见情况）：
    - 默认就是允许的，直接用 Write/Edit/git 操作即可，无需任何授权。

@@ -135,6 +135,10 @@ async function cmdEnter(params, cwd) {
 async function cmdExit(params, cwd) {
   const action = params.action || "keep";
   const confirmRemove = params.confirm_remove || false;
+  // v0.4.3：合并后收尾正规路径——worktree remove 成功后用 git branch -d 删已合并分支。
+  // 仅 action=remove 生效（keep 模式保留副本，删分支会让副本悬空）。严格布尔判定，
+  // 避免 "false"/0 等假值误触。
+  const deleteBranch = params.delete_branch === true;
   const { common, root } = C.findGitContextForCwd(cwd);
   if (!common) return fail("当前目录不在 git 仓库内。");
   const sessionId = getSessionId();
@@ -189,6 +193,7 @@ async function cmdExit(params, cwd) {
       if (rmLink.removed.length) lines.push(`- 已安全移除链接: ${rmLink.removed.join(", ")}`);
       if (rmLink.failed.length) lines.push(`- ⚠️ 移除链接失败: ${rmLink.failed.join("; ")}`);
     }
+    let removedOk = false;
     const r = C.runGit(["worktree", "remove", wtPath], root);
     if (r.code !== 0) {
       // v0.4.2 容错：Windows 下 remove 可能半成功（git 已注销注册、目录删除 EPERM，
@@ -196,11 +201,28 @@ async function cmdExit(params, cwd) {
       // 继续清绑定，目录残留提示手动处理，而不是卡死退出流程。
       if (/is not a working tree/i.test(r.stdout)) {
         lines.push(`⚠️ 副本已不在 git 注册表（可能此前 remove 半成功），绑定将清除；目录若有残留请手动删除。`);
+        removedOk = true;
       } else {
         return fail(`git worktree remove 失败: ${r.stdout}\n` + lines.join("\n"));
       }
     } else {
-      lines.push(`🗑️ 副本目录已删除（分支 ${branch} 保留）`);
+      lines.push(`🗑️ 副本目录已删除`);
+      removedOk = true;
+    }
+
+    // v0.4.3：删分支（用户反馈——合并后副本已删但分支留着、agent 跑 `git branch -d` 又被
+    // hook 无条件拦截、卡在 authorize-main）。此处直接在主 checkout 跑 git branch -d，
+    // 绕开 agent Bash 拦截，给合并收尾一条 agent 可自走的正规路径。安全由 -d 闸门保证：
+    // 仅删【已合并进 HEAD】的分支，未合并则 git 拒绝（非 -D），无需自定义合并判断。
+    if (deleteBranch && removedOk && branch) {
+      const del = C.runGit(["branch", "-d", branch], root);
+      if (del.code === 0) {
+        lines.push(`🌿 分支 ${branch} 已删除（已合并，git branch -d 校验通过）`);
+      } else {
+        lines.push(`📌 分支 ${branch} 保留：未合并进 HEAD 或仍被引用（${del.stdout.trim()}）。如确认不再需要，需用户授权后手动 git branch -D。`);
+      }
+    } else if (removedOk && branch) {
+      lines.push(`📌 分支 ${branch} 保留（exit 未带 delete_branch=true）。`);
     }
   }
 
@@ -211,6 +233,10 @@ async function cmdExit(params, cwd) {
   lines.push("\n✅ 本会话绑定已清除。");
   if (action === "keep") {
     lines.push(`📌 报告口径：worktree \`${branch}\` 已就绪，待您确认是否合并。`);
+    if (deleteBranch) {
+      lines.push("ℹ️ delete_branch 仅在 action=remove 时生效，本次（keep）已忽略。");
+    }
+    lines.push(`合并回主分支并确认无误后，收尾可一步完成：exit(action='remove', confirm_remove=true, delete_branch=true)——删副本目录 + 清理已合并分支。`);
   }
   ok(lines.join("\n"));
 }

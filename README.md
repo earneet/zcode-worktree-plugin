@@ -113,6 +113,9 @@ echo '{"action": "keep"}' | node <plugin>/scripts/wt.mjs exit
 echo '{"reason": "用户授权合并 fix-login"}' | node <plugin>/scripts/wt.mjs authorize-main
 # git merge worktree-fix-login …
 echo '{}' | node <plugin>/scripts/wt.mjs revoke-main
+
+# 收尾：删副本目录 + 清理已合并分支（git branch -d 仅删已合并；未合并则保留分支）
+echo '{"action": "remove", "confirm_remove": true, "delete_branch": true}' | node <plugin>/scripts/wt.mjs exit
 ```
 
 > `task_name` 必须是小写字母/数字/连字符的 slug（如 `fix-login`），不接受大写/下划线/空格/中文。
