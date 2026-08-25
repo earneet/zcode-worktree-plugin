@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // zcode-worktree-guard 生命周期脚本
-// create/enter/exit/status/authorize-main/revoke-main/allow
+// create/enter/exit/remove/status/authorize-main/revoke-main/allow
 // session 级绑定（bindings/<session_id>.json）+ subagent 继承 + 悬空检查。
 // v0.4：默认主副本开放——绑定只由本会话 enter 产生；state.json 仅记录最近活动 + 授权标记。
 // v0.4.1：会话 id 依赖注入——正常路径下 guard_hook 会给本脚本的 Bash 命令注入
@@ -132,6 +132,56 @@ async function cmdEnter(params, cwd) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.4.4：物理清理共享实现（exit(remove) 与 remove 子命令共用）。
+// 职责：安全删链接 → git worktree remove（含 v0.4.2 半成功容错）→ 可选 git branch -d。
+// 前置（调用方保证）：confirm_remove、脏检查、其他会话绑定检查均已通过。
+// 就地追加输出行；返回 { removedOk }——false 表示 git worktree remove 真失败。
+function cleanupWorktree(root, { wtPath, branch, deleteBranch }, lines) {
+  // 🔴 v0.3 安全清理：先删除 worktree 内的 symlink/junction，再 git worktree remove。
+  // 不先删 junction 直接递归删除可能跟随链接误删主仓库内容（如 node_modules）。
+  const cfg = C.loadConfig(root);
+  const { symlinkDirs } = C.syncConfig(cfg);
+  if (symlinkDirs.length) {
+    const rmLink = C.removeSyncedLinks(wtPath, symlinkDirs);
+    if (rmLink.removed.length) lines.push(`- 已安全移除链接: ${rmLink.removed.join(", ")}`);
+    if (rmLink.failed.length) lines.push(`- ⚠️ 移除链接失败: ${rmLink.failed.join("; ")}`);
+  }
+  let removedOk = false;
+  const r = C.runGit(["worktree", "remove", wtPath], root);
+  if (r.code !== 0) {
+    // v0.4.2 容错：Windows 下 remove 可能半成功（git 已注销注册、目录删除 EPERM，
+    // 如有进程占着副本目录）。此时重试报 "is not a working tree"——视为已注销，
+    // 继续清绑定，目录残留提示手动处理，而不是卡死退出流程。
+    if (/is not a working tree/i.test(r.stdout)) {
+      lines.push(`⚠️ 副本已不在 git 注册表（可能此前 remove 半成功）；目录若有残留请手动删除。`);
+      removedOk = true;
+    } else {
+      lines.push(`git worktree remove 失败: ${r.stdout}`);
+      return { removedOk: false };
+    }
+  } else {
+    lines.push(`🗑️ 副本目录已删除`);
+    removedOk = true;
+  }
+
+  // v0.4.3：删分支（用户反馈——合并后副本已删但分支留着、agent 跑 `git branch -d` 又被
+  // hook 无条件拦截、卡在 authorize-main）。此处直接在主 checkout 跑 git branch -d，
+  // 绕开 agent Bash 拦截，给合并收尾一条 agent 可自走的正规路径。安全由 -d 闸门保证：
+  // 仅删【已合并进 HEAD】的分支，未合并则 git 拒绝（非 -D），无需自定义合并判断。
+  if (deleteBranch && removedOk && branch) {
+    const del = C.runGit(["branch", "-d", branch], root);
+    if (del.code === 0) {
+      lines.push(`🌿 分支 ${branch} 已删除（已合并，git branch -d 校验通过）`);
+    } else {
+      lines.push(`📌 分支 ${branch} 保留：未合并进 HEAD 或仍被引用（${del.stdout.trim()}）。如确认不再需要，需用户授权后手动 git branch -D。`);
+    }
+  } else if (removedOk && branch) {
+    lines.push(`📌 分支 ${branch} 保留（未带 delete_branch=true）。`);
+  }
+  return { removedOk };
+}
+
+// ---------------------------------------------------------------------------
 async function cmdExit(params, cwd) {
   const action = params.action || "keep";
   const confirmRemove = params.confirm_remove || false;
@@ -184,46 +234,8 @@ async function cmdExit(params, cwd) {
   if (action === "remove") {
     if (!confirmRemove) return fail("action=remove 需要 confirm_remove=true。\n" + lines.join("\n"));
     if (nDirty) return fail("工作区有未提交改动，拒绝删除。\n" + lines.join("\n"));
-    // 🔴 v0.3 安全清理：先删除 worktree 内的 symlink/junction，再 git worktree remove。
-    // 不先删 junction 直接递归删除可能跟随链接误删主仓库内容（如 node_modules）。
-    const cfg = C.loadConfig(root);
-    const { symlinkDirs } = C.syncConfig(cfg);
-    if (symlinkDirs.length) {
-      const rmLink = C.removeSyncedLinks(wtPath, symlinkDirs);
-      if (rmLink.removed.length) lines.push(`- 已安全移除链接: ${rmLink.removed.join(", ")}`);
-      if (rmLink.failed.length) lines.push(`- ⚠️ 移除链接失败: ${rmLink.failed.join("; ")}`);
-    }
-    let removedOk = false;
-    const r = C.runGit(["worktree", "remove", wtPath], root);
-    if (r.code !== 0) {
-      // v0.4.2 容错：Windows 下 remove 可能半成功（git 已注销注册、目录删除 EPERM，
-      // 如有进程占着副本目录）。此时重试报 "is not a working tree"——视为已注销，
-      // 继续清绑定，目录残留提示手动处理，而不是卡死退出流程。
-      if (/is not a working tree/i.test(r.stdout)) {
-        lines.push(`⚠️ 副本已不在 git 注册表（可能此前 remove 半成功），绑定将清除；目录若有残留请手动删除。`);
-        removedOk = true;
-      } else {
-        return fail(`git worktree remove 失败: ${r.stdout}\n` + lines.join("\n"));
-      }
-    } else {
-      lines.push(`🗑️ 副本目录已删除`);
-      removedOk = true;
-    }
-
-    // v0.4.3：删分支（用户反馈——合并后副本已删但分支留着、agent 跑 `git branch -d` 又被
-    // hook 无条件拦截、卡在 authorize-main）。此处直接在主 checkout 跑 git branch -d，
-    // 绕开 agent Bash 拦截，给合并收尾一条 agent 可自走的正规路径。安全由 -d 闸门保证：
-    // 仅删【已合并进 HEAD】的分支，未合并则 git 拒绝（非 -D），无需自定义合并判断。
-    if (deleteBranch && removedOk && branch) {
-      const del = C.runGit(["branch", "-d", branch], root);
-      if (del.code === 0) {
-        lines.push(`🌿 分支 ${branch} 已删除（已合并，git branch -d 校验通过）`);
-      } else {
-        lines.push(`📌 分支 ${branch} 保留：未合并进 HEAD 或仍被引用（${del.stdout.trim()}）。如确认不再需要，需用户授权后手动 git branch -D。`);
-      }
-    } else if (removedOk && branch) {
-      lines.push(`📌 分支 ${branch} 保留（exit 未带 delete_branch=true）。`);
-    }
+    const res = cleanupWorktree(root, { wtPath, branch, deleteBranch }, lines);
+    if (!res.removedOk) return fail(lines.join("\n"));
   }
 
   C.clearBinding(common, sessionId);
@@ -236,8 +248,87 @@ async function cmdExit(params, cwd) {
     if (deleteBranch) {
       lines.push("ℹ️ delete_branch 仅在 action=remove 时生效，本次（keep）已忽略。");
     }
-    lines.push(`合并回主分支并确认无误后，收尾可一步完成：exit(action='remove', confirm_remove=true, delete_branch=true)——删副本目录 + 清理已合并分支。`);
+    lines.push(`合并回主分支并确认无误后收尾（删副本目录 + 清理已合并分支，git branch -d 仅删已合并）：`);
+    lines.push(`- 仍持绑定时: exit(action='remove', confirm_remove=true, delete_branch=true)`);
+    lines.push(`- 本命令之后（已退出）再合并的: {"path":"${wtPath}","confirm_remove":true,"delete_branch":true} 传给 remove 子命令`);
   }
+  ok(lines.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// v0.4.4：remove 子命令——exit-first 流的收尾路径（issue 反馈①）。
+// 场景：exit(keep) 先退出 → 主副本自由合并（默认开放）→ 此时本会话已无绑定，
+// exit(remove) 报"没有活动 worktree"、state 也已清——清理链路断裂，agent 只能
+// 裸跑 git worktree remove（放行）+ git branch -d（被拦）。remove 接受显式 path：
+//   ① path 是已注册 worktree → 完整清理（安全删链接 → worktree remove → 可选删分支）
+//   ② path 已不在注册表（如 agent 手动 git worktree remove 过）但同名 worktree-*
+//      分支仍在 → 仅剩分支清理（-d 闸门：仅删已合并）
+async function cmdRemove(params, cwd) {
+  const raw = (params.path || "").trim();
+  if (!raw) return fail("缺少 path 参数");
+  const { root, common } = C.findGitContextForCwd(cwd);
+  if (!common) return fail("当前目录不在 git 仓库内。");
+  const absPath = path.isAbsolute(raw) ? raw : path.join(root, raw);
+  const sessionId = getSessionId();
+  const cfg = C.loadConfig(root);
+  const prefix = C.branchPrefix(cfg);
+  const deleteBranch = params.delete_branch === true;
+  const lines = [];
+
+  // 已注册 worktree（排除主 checkout 自身）
+  const wts = C.registeredWorktrees(root);
+  const target = wts.find((w) => C.norm(w.path) === C.norm(absPath) && C.norm(w.path) !== C.norm(root));
+  let branch = "";
+  if (target) {
+    branch = target.branch || "";
+    if (!branch) {
+      const r = C.runGit(["branch", "--show-current"], target.path);
+      branch = r.stdout;
+    }
+  } else {
+    // 形态②：分支残留。目录名即分支名（create 约定），必须匹配分支前缀且 ref 存在。
+    branch = path.basename(absPath.replace(/[\\/]+$/, ""));
+    const isRef = C.runGit(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], root);
+    if (isRef.code !== 0 || !branch.startsWith(prefix)) {
+      return fail(`${absPath} 不是本仓库已注册的 worktree，也未能定位可清理的 ${prefix}* 分支残留。`);
+    }
+    lines.push(`⚠️ 目录已不在 git worktree 注册表，仅做分支清理: ${branch}`);
+    if (!deleteBranch) {
+      return fail(`副本已不存在、仅剩分支 ${branch}——请带 delete_branch=true 清理（git branch -d 仅删已合并）。`);
+    }
+  }
+
+  // 其他会话绑定 → 拒绝（与 exit(remove) 同规矩）
+  const otherSessions = C.findBindingsForWorktree(common, absPath).filter((s) => s !== sessionId);
+  if (otherSessions.length > 0) {
+    return fail(`worktree ${absPath} 仍被其他会话绑定: ${otherSessions.join(", ")}。请先让那些会话退出。`);
+  }
+
+  if (params.confirm_remove !== true) {
+    return fail("remove 需要 confirm_remove=true。");
+  }
+
+  // 已注册形态：脏检查（分支残留形态无工作区，-d 闸门兜底）
+  if (target) {
+    const { symlinkDirs } = C.syncConfig(cfg);
+    const dirty = C.dirtySummary(target.path, symlinkDirs);
+    if (dirty.count) return fail(`工作区有未提交改动（${dirty.count} 个文件），拒绝删除。先提交或用 exit 汇报。`);
+  }
+
+  const res = cleanupWorktree(root, { wtPath: absPath, branch, deleteBranch }, lines);
+  if (!res.removedOk) return fail(lines.join("\n"));
+
+  // 本会话若仍绑定该副本（remove 兼作退出）→ 清绑定；state 记录匹配 → 清除
+  const binding = C.loadBinding(common, sessionId);
+  if (binding && binding.worktree && C.norm(binding.worktree) === C.norm(absPath)) {
+    C.clearBinding(common, sessionId);
+    lines.push("本会话绑定已清除。");
+  }
+  const state = C.loadStateByCommon(common);
+  if (state && state.path && C.norm(state.path) === C.norm(absPath)) {
+    C.clearStateByCommon(common);
+  }
+  lines.push("\n✅ remove 完成。");
   ok(lines.join("\n"));
 }
 
@@ -283,7 +374,8 @@ async function cmdStatus(params, cwd) {
       ? `最近活动 worktree（仅记录，非绑定）: ${state.path} [${state.branch}]`
       : "最近活动 worktree: 无"
   );
-  if (C.loadGlobalAllow(common)) lines.push("⚠️ 全局授权: 已启用（authorize-main）");
+  const allowExp = C.globalAllowExpiry(common);
+  if (allowExp) lines.push(`⚠️ 全局授权: 已启用（authorize-main，至 ${fmtLocal(allowExp)} 本地到期）`);
   ok(lines.join("\n"));
 }
 
@@ -291,8 +383,16 @@ async function cmdStatus(params, cwd) {
 async function cmdAuthorize(params, cwd) {
   const { common } = C.findGitContextForCwd(cwd);
   if (!common) return fail("当前目录不在 git 仓库内。");
-  C.setGlobalAllow(common, (params.reason || "用户授权").trim());
-  ok(`✅ 已授权全局主 checkout 写入\n注意：完成后应立即 revoke-main。`);
+  // v0.4.4 TTL（外部反馈：revoke 靠自觉，忘了就无限期裸奔）：默认 15 分钟自动失效。
+  const ttlRaw = parseInt(params.ttl_minutes ?? "", 10);
+  const ttl = Number.isFinite(ttlRaw) && ttlRaw > 0 ? ttlRaw : C.AUTH_DEFAULT_TTL_MIN;
+  C.setGlobalAllow(common, (params.reason || "用户授权").trim(), ttl);
+  const expiresAt = new Date(Date.now() + ttl * 60000).toISOString();
+  ok(
+    `✅ 已授权全局主 checkout 写入\n` +
+    `有效期至: ${fmtLocal(expiresAt)}（本地时间，约 ${ttl} 分钟；ttl_minutes 可调）\n` +
+    `注意：到期自动失效；提前完成应立即 revoke-main。`
+  );
 }
 
 async function cmdRevoke(params, cwd) {
@@ -364,7 +464,7 @@ async function main() {
   }
 
   const handlers = {
-    create: cmdCreate, enter: cmdEnter, exit: cmdExit, status: cmdStatus,
+    create: cmdCreate, enter: cmdEnter, exit: cmdExit, remove: cmdRemove, status: cmdStatus,
     "authorize-main": cmdAuthorize, "revoke-main": cmdRevoke, allow: cmdAllow,
   };
   const handler = handlers[action];

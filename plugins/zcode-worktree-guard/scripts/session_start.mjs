@@ -34,7 +34,9 @@ async function main() {
       `Write/Edit 写主 checkout 路径会自动重写到该 worktree；跨副本写、git push 到 master/main 仍拦截。\n` +
       `Bash 提示：每次调用都是新 shell（变量不跨调用保留）；要在副本内跑 git/编译/测试，先单条 cd "${existingBinding.worktree}"（会话工作目录会持久切换），再用相对路径操作；bash 里写绝对主 checkout 路径不会被重写。\n` +
       `退出（回到主副本开放）: echo '{"action":"keep"}' | node "${WT_TOOL}" exit\n` +
-      `合并后收尾（删副本目录 + 清理已合并分支，git branch -d 仅删已合并）: echo '{"action":"remove","confirm_remove":true,"delete_branch":true}' | node "${WT_TOOL}" exit`;
+      `合并后收尾（删副本目录 + 清理已合并分支，git branch -d 仅删已合并）:\n` +
+      `  绑定中: echo '{"action":"remove","confirm_remove":true,"delete_branch":true}' | node "${WT_TOOL}" exit\n` +
+      `  已退出: echo '{"path":"<worktree路径>","confirm_remove":true,"delete_branch":true}' | node "${WT_TOOL}" remove`;
   } else {
     const resolved = C.resolveBinding(common, sessionId);
     if (resolved) {

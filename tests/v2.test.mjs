@@ -2047,3 +2047,223 @@ describe("O. git -C 语境解析 + v0.4.2 修复", () => {
     assertBlock(r, "进入该副本");
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// P. v0.4.4（issue #1 反馈）: remove 子命令（exit-first 收尾）+ authorize-main TTL + 拦截文案重构
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("P. v0.4.4 remove / TTL / 拦截文案", () => {
+  let repo, common;
+  const stateJson = () => path.join(common, "worktree-guard", "state.json");
+
+  before(() => {
+    repo = makeRepo();
+    common = repoCommon(repo);
+  });
+  after(() => cleanupRepo(repo));
+
+  // --- remove 子命令：exit-first 流的收尾 ---
+
+  it("P01: exit-first 全流程——exit(keep) → merge → remove 收尾（删目录+删已合并分支）", () => {
+    const sid = "sess_p01";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "p1-flow" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-p1-flow" }, { env, cwd: repo });
+    const wt = path.join(repo, ".worktrees", "worktree-p1-flow");
+    spawnSync("git", ["commit", "-q", "--allow-empty", "-m", "work"], { cwd: wt, encoding: "utf8" });
+    const er = runWt("exit", { action: "keep" }, { env, cwd: repo });
+    assert.ok(!wtContent(er).includes("❌"), `exit 不应失败: ${wtContent(er).slice(0, 200)}`);
+    // exit 后（无绑定、默认开放态）自由合并——issue 报告者的自然流
+    const mg = spawnSync("git", ["merge", "-q", "worktree-p1-flow"], { cwd: repo, encoding: "utf8" });
+    assert.equal(mg.status ?? 1, 0, "merge 应成功");
+    const r = runWt("remove", { path: ".worktrees/worktree-p1-flow", confirm_remove: true, delete_branch: true },
+      { env, cwd: repo });
+    const c = wtContent(r);
+    assert.ok(c.includes("副本目录已删除"), `应删目录: ${c.slice(0, 300)}`);
+    assert.ok(c.includes("已删除（已合并"), `应删已合并分支: ${c.slice(0, 300)}`);
+    assert.ok(!fs.existsSync(wt), "副本目录应已不存在");
+    const br = spawnSync("git", ["branch", "--list", "worktree-p1-flow"], { cwd: repo, encoding: "utf8" });
+    assert.equal((br.stdout || "").trim(), "", "分支应已删除");
+    assert.equal(C.loadBinding(common, sid), null, "绑定应已清除");
+  });
+
+  it("P02: remove 未合并分支 → 删目录、保留分支（-d 闸门）", () => {
+    const sid = "sess_p02";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "p2-unmerged" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-p2-unmerged" }, { env, cwd: repo });
+    const wt = path.join(repo, ".worktrees", "worktree-p2-unmerged");
+    spawnSync("git", ["commit", "-q", "--allow-empty", "-m", "work"], { cwd: wt, encoding: "utf8" });
+    runWt("exit", { action: "keep" }, { env, cwd: repo });
+    const r = runWt("remove", { path: ".worktrees/worktree-p2-unmerged", confirm_remove: true, delete_branch: true },
+      { env, cwd: repo });
+    const c = wtContent(r);
+    assert.ok(c.includes("副本目录已删除"), `应删目录: ${c.slice(0, 300)}`);
+    assert.ok(c.includes("保留"), `未合并分支应保留: ${c.slice(0, 300)}`);
+    const br = spawnSync("git", ["branch", "--list", "worktree-p2-unmerged"], { cwd: repo, encoding: "utf8" });
+    assert.ok((br.stdout || "").includes("worktree-p2-unmerged"), "未合并分支应保留");
+    // 分支残留留给 P04 形态②复用
+  });
+
+  it("P03: remove 缺 confirm_remove → 拒绝（已注册副本形态）", () => {
+    runWt("create", { task_name: "p3-confirm" }, { cwd: repo });
+    const r = runWt("remove", { path: ".worktrees/worktree-p3-confirm" }, { cwd: repo });
+    assert.ok(wtContent(r).includes("❌"), "应失败");
+    assert.ok(wtContent(r).includes("confirm_remove"), `应提示 confirm: ${wtContent(r).slice(0, 200)}`);
+    // 残留形态（P02 留下的目录已删、分支未删）优先给更具体的 delete_branch 指引
+    const r2 = runWt("remove", { path: ".worktrees/worktree-p2-unmerged" }, { cwd: repo });
+    assert.ok(wtContent(r2).includes("delete_branch"), `残留形态应指引 delete_branch: ${wtContent(r2).slice(0, 200)}`);
+  });
+
+  it("P04: remove 形态②——目录已被手动 remove、仅剩分支 → 分支残留清理", () => {
+    // P02 留下的 worktree-p2-unmerged 分支；目录先手动注销（issue 实况）
+    const wt = path.join(repo, ".worktrees", "worktree-p2-unmerged");
+    spawnSync("git", ["merge", "-q", "worktree-p2-unmerged"], { cwd: repo, encoding: "utf8" });
+    spawnSync("git", ["worktree", "remove", wt], { cwd: repo, encoding: "utf8" });
+    const r = runWt("remove", { path: ".worktrees/worktree-p2-unmerged", confirm_remove: true, delete_branch: true },
+      { cwd: repo });
+    const c = wtContent(r);
+    assert.ok(c.includes("仅做分支清理"), `应提示分支残留模式: ${c.slice(0, 300)}`);
+    assert.ok(c.includes("已删除（已合并"), `应删已合并分支: ${c.slice(0, 300)}`);
+    const br = spawnSync("git", ["branch", "--list", "worktree-p2-unmerged"], { cwd: repo, encoding: "utf8" });
+    assert.equal((br.stdout || "").trim(), "", "分支应已删除");
+  });
+
+  it("P05: remove 形态② 不带 delete_branch → 拒绝并指引", () => {
+    // 造一个仅剩分支的残留（创建→合并→手动 remove 目录）
+    runWt("create", { task_name: "p5-left" }, { cwd: repo });
+    spawnSync("git", ["commit", "-q", "--allow-empty", "-m", "w"],
+      { cwd: path.join(repo, ".worktrees", "worktree-p5-left"), encoding: "utf8" });
+    spawnSync("git", ["merge", "-q", "worktree-p5-left"], { cwd: repo, encoding: "utf8" });
+    spawnSync("git", ["worktree", "remove", path.join(repo, ".worktrees", "worktree-p5-left")],
+      { cwd: repo, encoding: "utf8" });
+    const r = runWt("remove", { path: ".worktrees/worktree-p5-left", confirm_remove: true }, { cwd: repo });
+    assert.ok(wtContent(r).includes("❌"), "应失败");
+    assert.ok(wtContent(r).includes("delete_branch"), `应指引 delete_branch: ${wtContent(r).slice(0, 200)}`);
+  });
+
+  it("P06: remove 目标仍被其他会话绑定 → 拒绝", () => {
+    const envA = { ZCODE_SESSION_ID: "sess_p06a" };
+    runWt("create", { task_name: "p6-occ" }, { env: envA, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-p6-occ" }, { env: envA, cwd: repo });
+    const r = runWt("remove", { path: ".worktrees/worktree-p6-occ", confirm_remove: true, delete_branch: true },
+      { env: { ZCODE_SESSION_ID: "sess_p06b" }, cwd: repo });
+    assert.ok(wtContent(r).includes("❌"), "应失败");
+    assert.ok(wtContent(r).includes("其他会话绑定"), `应提示占用: ${wtContent(r).slice(0, 200)}`);
+    runWt("exit", { action: "keep" }, { env: envA, cwd: repo }); // 清理
+  });
+
+  it("P07: remove 脏工作区 → 拒绝删除", () => {
+    const sid = "sess_p07";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "p7-dirty" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-p7-dirty" }, { env, cwd: repo });
+    fs.writeFileSync(path.join(repo, ".worktrees", "worktree-p7-dirty", "dirty.txt"), "x");
+    runWt("exit", { action: "keep" }, { env, cwd: repo });
+    const r = runWt("remove", { path: ".worktrees/worktree-p7-dirty", confirm_remove: true }, { env, cwd: repo });
+    assert.ok(wtContent(r).includes("❌"), "应失败");
+    assert.ok(wtContent(r).includes("未提交改动"), `应提示脏区: ${wtContent(r).slice(0, 200)}`);
+  });
+
+  it("P08: remove 自身绑定态 → 兼作退出（清绑定）", () => {
+    const sid = "sess_p08";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "p8-self" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-p8-self" }, { env, cwd: repo });
+    const r = runWt("remove", { path: ".worktrees/worktree-p8-self", confirm_remove: true, delete_branch: true },
+      { env, cwd: repo });
+    const c = wtContent(r);
+    assert.ok(!c.includes("❌"), `不应失败: ${c.slice(0, 300)}`);
+    assert.ok(c.includes("本会话绑定已清除"), `应清自绑定: ${c.slice(0, 300)}`);
+    assert.equal(C.loadBinding(common, sid), null, "绑定文件应已清除");
+  });
+
+  it("P09: remove 非注册路径且无分支残留 → 拒绝", () => {
+    const r = runWt("remove", { path: ".worktrees/worktree-nonexistent", confirm_remove: true }, { cwd: repo });
+    assert.ok(wtContent(r).includes("❌"), "应失败");
+    assert.ok(wtContent(r).includes("不是本仓库已注册"), `应提示未注册: ${wtContent(r).slice(0, 200)}`);
+  });
+
+  // --- authorize-main TTL ---
+
+  it("P10: authorize-main 默认写入 15 分钟 TTL，生效中", () => {
+    const r = runWt("authorize-main", { reason: "TTL 测试" }, { cwd: repo });
+    const c = wtContent(r);
+    assert.ok(c.includes("有效期至"), `应显示有效期: ${c.slice(0, 200)}`);
+    assert.ok(c.includes("约 15 分钟"), `默认 15 分钟: ${c.slice(0, 200)}`);
+    const s = JSON.parse(fs.readFileSync(stateJson(), "utf8"));
+    const exp = new Date(s.allow_expires_at).getTime();
+    assert.ok(exp > Date.now() && exp < Date.now() + 16 * 60000, "expires_at 应在 ~15 分钟后");
+    assert.equal(C.loadGlobalAllow(common), true, "授权应生效");
+  });
+
+  it("P11: TTL 过期 → loadGlobalAllow 判负，hook 恢复拦截", () => {
+    const s = JSON.parse(fs.readFileSync(stateJson(), "utf8"));
+    s.allow_expires_at = new Date(Date.now() - 1000).toISOString();
+    fs.writeFileSync(stateJson(), JSON.stringify(s));
+    assert.equal(C.loadGlobalAllow(common), false, "过期授权应失效");
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: "sess_p11",
+      tool_input: { command: "git push origin master" },
+    });
+    assertBlock(r, "push");
+  });
+
+  it("P12: ttl_minutes 可调；非法值回落默认 15", () => {
+    const r5 = runWt("authorize-main", { reason: "x", ttl_minutes: 5 }, { cwd: repo });
+    assert.ok(wtContent(r5).includes("约 5 分钟"), `应显示 5 分钟: ${wtContent(r5).slice(0, 200)}`);
+    const rBad = runWt("authorize-main", { reason: "x", ttl_minutes: "abc" }, { cwd: repo });
+    assert.ok(wtContent(rBad).includes("约 15 分钟"), `非法值应回落 15: ${wtContent(rBad).slice(0, 200)}`);
+  });
+
+  it("P13: 旧版数据（allow_main_writes 无 expires_at）→ 视为已过期（收紧）", () => {
+    const s = JSON.parse(fs.readFileSync(stateJson(), "utf8"));
+    delete s.allow_expires_at;
+    fs.writeFileSync(stateJson(), JSON.stringify(s));
+    assert.equal(C.loadGlobalAllow(common), false, "无 TTL 的旧授权应视为过期");
+  });
+
+  it("P14: revoke-main 清除全部授权字段（含 expires_at）", () => {
+    runWt("authorize-main", { reason: "x" }, { cwd: repo });
+    runWt("revoke-main", {}, { cwd: repo });
+    const s = JSON.parse(fs.readFileSync(stateJson(), "utf8"));
+    assert.ok(!("allow_main_writes" in s) && !("allow_expires_at" in s), "授权字段应全清");
+  });
+
+  // --- 拦截文案重构（反馈③④）---
+
+  it("P15: push 拦截文案——解法前置、含可复制 authorize 命令与拆分执行提示", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: "sess_p15",
+      tool_input: { command: "git push origin master" },
+    });
+    assertBlock(r, "push");
+    const err = r.stderr;
+    assert.ok(err.includes("→ 解法"), `应有解法段: ${err.slice(0, 300)}`);
+    assert.ok(err.includes("authorize-main"), `应含 authorize 命令: ${err.slice(0, 300)}`);
+    assert.ok(err.includes("拆开分步执行"), `应有组合命令提示: ${err.slice(0, 300)}`);
+    assert.ok(err.indexOf("🔴 worktree-guard 拦截") < err.indexOf("→ 解法"), "拦截原因应在解法之前");
+  });
+
+  it("P16: git branch -d 拦截文案——含 exit(delete_branch) 与 remove 两条收尾指引", () => {
+    const r = runHook({
+      tool_name: "Bash", cwd: repo, session_id: "sess_p16",
+      tool_input: { command: "git branch -d worktree-p16" },
+    });
+    assertBlock(r);
+    const err = r.stderr;
+    assert.ok(err.includes("delete_branch"), `应含 exit(delete_branch): ${err.slice(0, 300)}`);
+    assert.ok(err.includes("remove"), `应含 remove 指引: ${err.slice(0, 400)}`);
+  });
+
+  it("P17: 跨副本写拦截文案——enter 指引 + 可复制 enter 命令", () => {
+    // 造一个已注册的其他副本
+    runWt("create", { task_name: "p17-other" }, { cwd: repo });
+    const r = runHook({
+      tool_name: "Write", cwd: repo, session_id: "sess_p17",
+      tool_input: { file_path: path.join(repo, ".worktrees", "worktree-p17-other", "z.js"), content: "z" },
+    });
+    assertBlock(r, "进入该副本");
+    assert.ok(r.stderr.includes("enter"), `解法应含 enter 命令: ${r.stderr.slice(0, 300)}`);
+  });
+});

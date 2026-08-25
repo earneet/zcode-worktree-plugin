@@ -38,24 +38,31 @@ function emitRewrite(updatedInput) {
   process.exit(0);
 }
 
-function block(reason, ctx) {
+// v0.4.4 文案重构（外部反馈：拦截提示单行长文本，可执行的放行命令埋在第 3 条、
+// 被终端截断到不可见，最终靠读插件源码才找到）。原则：
+//   ① 拦截原因置顶；② 针对性解法 + 可复制命令紧随其后；③ 上下文压缩为一行后置；
+//   ④ Bash 拦截附带"组合命令请拆开执行"提示（反馈④：授权/退出与目标操作同写一条
+//     命令时，hook 静态检查在执行前，授权不会先生效——整条被拦且无解释）。
+function block(reason, ctx, remedy) {
   const target = ctx.target || ctx.command || "(无)";
-  process.stderr.write(
-    "\n🔴🔴🔴 worktree-guard 拦截 🔴🔴🔴\n\n" +
-    "当前上下文:\n" +
-    `  当前分支: ${ctx.branch}\n` +
-    `  当前位置: ${ctx.cwd}\n` +
-    `  主 checkout 根: ${ctx.root}\n` +
-    `  活动 worktree: ${ctx.binding ? ctx.binding.worktree : "无"}\n` +
-    `  目标/命令: ${target}\n\n` +
-    `拦截原因: ${reason}\n\n` +
-    "修正方式（按需）:\n" +
-    "1. 写主 checkout 一般是允许的（默认开放）——若你正持有 enter 绑定又想写主副本，先 exit 退出该会话绑定；\n" +
-    "2. 跨副本/`.git` 写是硬拦截——确认目标路径正确；\n" +
-    "3. git push 到 master/main、删 worktree 分支需用户明确授权：echo '{\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" authorize-main；若该 worktree 分支已合并进主分支，也可用 exit(action='remove', confirm_remove=true, delete_branch=true) 在删副本时一并安全清理（git branch -d 仅删已合并）。\n" +
-    "4. 需临时写主目录某文件（已绑定时）：echo '{\"action\":\"add\",\"path\":\"<相对路径>\",\"reason\":\"...\"}' | node \"" + WT_TOOL + "\" allow；\n" +
-    `（脚本: node "${WT_TOOL}" <create|enter|exit|allow|authorize-main|revoke-main>，stdin 传 JSON）\n`
+  const L = [];
+  L.push(`🔴 worktree-guard 拦截: ${reason}`);
+  if (remedy) {
+    L.push("");
+    L.push("→ 解法（命令可整行复制）:");
+    L.push(remedy);
+  }
+  L.push("");
+  L.push(
+    `上下文: 分支 ${ctx.branch} | cwd ${ctx.cwd} | 主 checkout ${ctx.root} | ` +
+    `活动 worktree ${ctx.binding ? ctx.binding.worktree : "无"}`
   );
+  L.push(`目标/命令: ${target}`);
+  if (ctx.command) {
+    L.push("⚠️ 组合命令（A && B / A; B）在执行前被整条静态检查——authorize/exit 不会先于拦截生效，请拆开分步执行。");
+  }
+  L.push(`（脚本: node "${WT_TOOL}" <create|enter|exit|remove|status|allow|authorize-main|revoke-main>，stdin 传 JSON）`);
+  process.stderr.write("\n" + L.join("\n") + "\n");
   process.exit(2);
 }
 
@@ -121,6 +128,7 @@ function decideWrite(target, ctx, isWrite) {
       return {
         action: "deny",
         reason: "目标路径在其他 worktree 副本内，不允许跨副本写入。若要在此副本内工作，先用 wt.mjs enter 进入该副本；若目标本就该是当前副本，请核对路径。",
+        remedy: `进入该副本: echo '{"path":"<该副本路径>"}' | node "${WT_TOOL}" enter`,
       };
     }
     return { action: "allow", source: "read-cross-worktree" };
@@ -158,7 +166,7 @@ function handleFilePathTool(toolInput, context, isWrite) {
     emitRewrite({ ...toolInput, file_path: decision.newTarget });
   }
   // deny
-  block(decision.reason, context);
+  block(decision.reason, context, decision.remedy);
 }
 
 // ---------------------------------------------------------------------------
@@ -220,30 +228,43 @@ function handleBash(toolInput, context) {
 
   // 1. git push 到 master/main
   if (GIT_PUSH_PROTECTED_RE.test(command) || (GIT_PUSH_DEFAULT_RE.test(command) && protected_.has(branchL))) {
-    block("git push 到受保护分支（master/main），必须用户明确授权。", context);
+    block("git push 到受保护分支（master/main），必须用户明确授权。", context,
+      "用户授权后分三步独立执行:\n" +
+      `  1. echo '{"reason":"<原因>"}' | node "${WT_TOOL}" authorize-main\n` +
+      "  2. 单独重试 git push\n" +
+      `  3. echo '{}' | node "${WT_TOOL}" revoke-main`);
   }
 
   // 2. 有绑定时禁止切到受保护分支
   if (hasBinding || context.in_worktree) {
     const m = GIT_CHECKOUT_RE.exec(command);
     if (m && protected_.has(m[2].toLowerCase())) {
-      block(`当前有 worktree 绑定，禁止 git checkout/switch ${m[2]}。`, context);
+      block(`当前有 worktree 绑定，禁止 git checkout/switch ${m[2]}。`, context,
+        `先退出本会话绑定: echo '{"action":"keep"}' | node "${WT_TOOL}" exit`);
     }
   }
 
   // 3. 删 worktree 分支
   if (GIT_DEL_WORKTREE_RE.test(command)) {
-    block("删除 worktree 分支必须用户明确授权。", context);
+    block("删除 worktree 分支必须用户明确授权。", context,
+      "分支已合并进主分支时走正规收尾（git branch -d 仅删已合并，未合并自动保留）:\n" +
+      `  绑定中: echo '{"action":"remove","confirm_remove":true,"delete_branch":true}' | node "${WT_TOOL}" exit\n` +
+      `  已退出: echo '{"path":"<worktree路径>","confirm_remove":true,"delete_branch":true}' | node "${WT_TOOL}" remove\n` +
+      "或经用户授权后单独重试: authorize-main → git branch -d → revoke-main");
   }
 
   // 4. merge/rebase/pull 检查（仅绑定/在副本内时拦截；默认开放态主副本 git 自由）
   if ((hasBinding || context.in_worktree) && GIT_MUTATE_RE.test(command)) {
     if (protected_.has(branchL)) {
-      block(`当前有 worktree 绑定/在副本内，在受保护分支 ${branch} 上 merge/rebase/pull 需用户明确授权。`, context);
+      block(`当前有 worktree 绑定/在副本内，在受保护分支 ${branch} 上 merge/rebase/pull 需用户明确授权。`, context,
+        `先退出绑定即可在主副本自由操作（默认开放）: echo '{"action":"keep"}' | node "${WT_TOOL}" exit\n` +
+        "或经用户授权: authorize-main → 重试 → revoke-main（分步执行）");
     }
     const m = GIT_MERGE_TARGET_RE.exec(command);
     if (m) {
-      block(`检测到合并 ${m[2]} 到 ${branch}。worktree 分支只能合并到主分支，且须用户授权。`, context);
+      block(`检测到合并 ${m[2]} 到 ${branch}。worktree 分支只能合并到主分支，且须用户授权。`, context,
+        `经用户授权后分三步: authorize-main → git merge ${m[2]} → revoke-main\n` +
+        `或先退出绑定: echo '{"action":"keep"}' | node "${WT_TOOL}" exit`);
     }
   }
 

@@ -2,6 +2,61 @@
 
 本文件记录 zcode-worktree-guard 的版本演进。详细设计见 [docs/design.md](docs/design.md)。
 
+## [0.4.4] — 2026-08-25
+
+### 背景：issue #1（v0.4.2 全生命周期实测反馈）
+
+外部 agent 实测反馈四点：①清理链路断裂（exit 后无 remove 路径）；②authorize-main
+粒度过粗且 revoke 靠自觉；③拦截提示单行长文本、放行命令被截断到不可见（最终靠读源码
+找到命令）；④组合命令整行匹配、无"请拆开执行"说明。本版按评估结论逐条处理（①remove
+子命令 + ②TTL + ③④文案重构；按操作授权/`&&` 语义拆分/svn 拦截评估为不做）。
+
+### 新增：`remove` 子命令——exit-first 流的收尾正规路径（反馈①）
+
+报告者的自然流是 `exit(keep) 先退出 → 主副本自由合并（默认开放，无需授权）→ 清理`。
+但 exit 后绑定与 state 均已清空，`exit(remove)` 报"没有活动 worktree"；agent 只能裸跑
+`git worktree remove`（放行）+ `git branch -d`（被拦）——清理链路断裂。v0.4.3 的
+`exit(delete_branch)` 只覆盖"绑定中收尾"，未覆盖此流。
+
+**修复**：`wt.mjs remove {path, confirm_remove, delete_branch}` 接受显式 path，无需
+活动绑定。两种形态：①path 是已注册 worktree → 完整清理（安全删链接 → worktree
+remove → 可选删分支）；②path 已不在注册表（如已手动 remove）但同名 `worktree-*`
+分支仍在（目录名=分支名约定 + 前缀校验）→ 仅剩分支清理。安全闸门与 exit(remove)
+一致：其他会话绑定拒绝、脏工作区拒绝、`confirm_remove` 必需、分支删除仅 `git
+branch -d`（未合并自动保留）。自身绑定态调用 remove 兼作退出（清绑定）。
+
+```bash
+# exit-first 流收尾：删副本目录 + 清理已合并分支
+echo '{"path":".worktrees/worktree-<slug>","confirm_remove":true,"delete_branch":true}' | node "<WT>" remove
+```
+
+### 新增：authorize-main TTL（反馈②）
+
+`allow_main_writes` 此前无过期机制——revoke 全靠调用方自觉，忘了就无限期裸奔
+（实测确认）。现在授权默认 **15 分钟自动失效**（`ttl_minutes` 可调），输出与
+`status` 显示本地到期时间。旧版本写入的无 `allow_expires_at` 授权按已过期处理
+（收紧方向）。按操作收窄授权（`--op branch-delete`）评估后不做：`exit(delete_branch)`
++ `remove` 已覆盖高频场景，剩余授权场景（绑定态 merge/push master）本就是全局写性质。
+
+### 重构：拦截文案——解法前置 + 可复制命令 + 拆分执行提示（反馈③④）
+
+旧文案把可执行的放行命令埋在"修正方式"第 3 条、排在 5 行上下文之后，终端截断后
+不可见。新版结构：**拦截原因置顶 → 针对性解法（含可整行复制的命令）紧随 → 上下文
+压缩为一行后置**。每类拦截给专属解法（push → authorize 三步、删分支 → exit/remove
+两条收尾路径、跨副本写 → enter 命令、受保护分支 mutate → exit 或授权）。Bash 拦截
+追加提示：**组合命令（A && B）在执行前被整条静态检查，authorize/exit 不会先生效，
+请拆开分步执行**（反馈④：`authorize-main && git branch -d` 被拦且无解释，agent 靠
+试错才发现要拆）。按 `&&`/`;` 语义拆分评估为不可行：PreToolUse hook 在任何一段执行
+前求值，"预知"授权将发生等于允许命令行内自我授权。
+
+### 测试
+
+`tests/v2.test.mjs` 新增 P 组 17 用例：P01-P09 remove 子命令（exit-first 全流程、
+未合并保留、confirm 闸门、形态②分支残留、他席占用、脏区、自绑定兼退出、未注册拒绝）、
+P10-P14 TTL（默认 15min/过期判负/hook 恢复拦截/ttl_minutes/旧数据收紧/revoke 清字段）、
+P15-P17 文案（解法前置、authorize/remove/enter 指引、拆分执行提示）。全量 **177 用例
+全绿**（160 既有零翻转）。
+
 ## [0.4.3] — 2026-08-14
 
 ### 新增：`exit` 的 `delete_branch` —— 合并后收尾的 agent 正规路径（外部反馈）
