@@ -248,9 +248,16 @@ async function cmdExit(params, cwd) {
     if (deleteBranch) {
       lines.push("ℹ️ delete_branch 仅在 action=remove 时生效，本次（keep）已忽略。");
     }
+    // v0.4.4 审查修复：回执里的 remove 示例必须可直接复制执行——Windows 绝对路径含
+    // 未转义反斜杠，拼进 JSON 字符串是非法转义（agent 照抄 → JSON.parse 失败 → "缺少
+    // path 参数"）。改用仓库内相对路径（正斜杠），JSON.stringify 兜底转义任何特殊字符。
+    const removePath = C.isInside(C.norm(wtPath), C.norm(root))
+      ? path.relative(root, wtPath).split(path.sep).join("/")
+      : wtPath;
+    const removeExample = JSON.stringify({ path: removePath, confirm_remove: true, delete_branch: true });
     lines.push(`合并回主分支并确认无误后收尾（删副本目录 + 清理已合并分支，git branch -d 仅删已合并）：`);
     lines.push(`- 仍持绑定时: exit(action='remove', confirm_remove=true, delete_branch=true)`);
-    lines.push(`- 本命令之后（已退出）再合并的: {"path":"${wtPath}","confirm_remove":true,"delete_branch":true} 传给 remove 子命令`);
+    lines.push(`- 本命令之后（已退出）再合并的: ${removeExample} 传给 remove 子命令`);
   }
   ok(lines.join("\n"));
 }
@@ -286,6 +293,11 @@ async function cmdRemove(params, cwd) {
       branch = r.stdout;
     }
   } else {
+    // v0.4.4 审查修复：分支残留形态要求路径在本仓库内——仓库外路径仅凭 basename
+    // 撞名即可触发清理流程（虽然 -d 闸门兜底，语义上不应受理外部路径）。
+    if (!C.isInside(C.norm(absPath), C.norm(root))) {
+      return fail(`${absPath} 不在本仓库内，拒绝清理。`);
+    }
     // 形态②：分支残留。目录名即分支名（create 约定），必须匹配分支前缀且 ref 存在。
     branch = path.basename(absPath.replace(/[\\/]+$/, ""));
     const isRef = C.runGit(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], root);

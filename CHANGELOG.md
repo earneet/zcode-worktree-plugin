@@ -57,6 +57,20 @@ P10-P14 TTL（默认 15min/过期判负/hook 恢复拦截/ttl_minutes/旧数据�
 P15-P17 文案（解法前置、authorize/remove/enter 指引、拆分执行提示）。全量 **177 用例
 全绿**（160 既有零翻转）。
 
+### 审查修复（同日，v0.4.4 自查）
+
+- **exit(keep) 回执的 remove 示例改为合法 JSON**：原先拼 Windows 绝对路径进 JSON
+  字符串——反斜杠未转义是非法 JSON 转义，agent 照抄执行会 `JSON.parse` 失败、
+  remove 报"缺少 path 参数"。改为仓库内相对路径（正斜杠）+ `JSON.stringify`
+  兜底转义，P18 回归锁（从回执提取示例并 parse）。
+- **remove 形态② 增加"路径须在本仓库内"约束**：仓库外路径仅凭 basename 与分支
+  撞名即可进入清理流程（-d 闸门虽兜底，语义上不应受理），现在直接拒绝。P19 覆盖
+  主 checkout 本身与仓库外路径两个拒绝面。
+- **P20 补形态②未合并分支用例**（-d 拒删、分支保留）；P16 断言收紧（原"含
+  remove"过弱——footer 子命令列表也含 remove，现断言 remove 命令行本体）。
+- **文档同步**：`commands/worktree.md` 路由表补 `remove` 与 `exit remove
+  delete-branch`；SKILL description 补"收尾清理"。
+
 ## [0.4.3] — 2026-08-14
 
 ### 新增：`exit` 的 `delete_branch` —— 合并后收尾的 agent 正规路径（外部反馈）

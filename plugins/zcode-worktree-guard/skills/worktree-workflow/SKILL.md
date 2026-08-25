@@ -1,6 +1,6 @@
 ---
 name: worktree-workflow
-description: 可选的 git worktree 隔离工作流。默认在主 checkout 自由工作（不拦截、不重写）；当用户想隔离一个任务到独立分支副本时，create + enter 后本会话的写路径会自动透明重写到该副本，合并回主分支需用户明确授权。用于进入/退出 worktree 副本、查询状态。
+description: 可选的 git worktree 隔离工作流。默认在主 checkout 自由工作（不拦截、不重写）；当用户想隔离一个任务到独立分支副本时，create + enter 后本会话的写路径会自动透明重写到该副本，合并回主分支需用户明确授权。用于进入/退出/收尾清理（exit remove 或 remove 子命令）worktree 副本、查询状态。
 ---
 
 # 可选的 git worktree 隔离工作流
