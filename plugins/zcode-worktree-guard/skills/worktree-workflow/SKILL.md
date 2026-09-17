@@ -104,9 +104,12 @@ echo '{"task_name": "fix-login", "base_branch": "main", "worktree_parent": ".wor
 echo '{"path": ".worktrees/worktree-add-drop-module"}' | node "<WT>" enter
 
 # 退出当前活动 worktree（保留副本，汇报领先提交与未提交改动）
+# 也可显式传 path（须与本会话绑定一致；无绑定时须是已注册副本）
 echo '{"action": "keep"}' | node "<WT>" exit
+echo '{"action": "keep", "path": ".worktrees/worktree-add-drop-module"}' | node "<WT>" exit
 
 # 删除副本（需显式确认且工作区干净；只删目录，分支保留）
+# 注意：无绑定 + remove 且不传 path 会被拒绝（state.json 是共享记录，不做删除目标的猜测）
 echo '{"action": "remove", "confirm_remove": true}' | node "<WT>" exit
 
 # 删副本 + 清理已合并分支（合并后收尾：git branch -d 仅删已合并分支，未合并则保留）
@@ -114,6 +117,11 @@ echo '{"action": "remove", "confirm_remove": true, "delete_branch": true}' | nod
 
 # remove 子命令（已 exit 之后的收尾，无需活动绑定；目录已被手动删时也可只清分支残留）
 echo '{"path": ".worktrees/worktree-add-drop-module", "confirm_remove": true, "delete_branch": true}' | node "<WT>" remove
+
+# 回收死会话绑定（会话异常结束遗留的绑定；默认清理静默超 24h 的会话与副本已消失的绑定）
+echo '{}' | node "<WT>" prune                          # 执行清理
+echo '{"dry_run": true}' | node "<WT>" prune           # 仅盘点不删除
+echo '{"idle_hours": 6}' | node "<WT>" prune           # 自定义静默阈值
 
 # 授权在主 checkout 上修改/合并（需用户明确授权后才可调用；默认 15 分钟自动失效，ttl_minutes 可调）
 echo '{"reason": "用户授权合并 worktree-add-drop-module"}' | node "<WT>" authorize-main
@@ -170,8 +178,16 @@ worktree、又想例外写主 checkout 某路径（绕过重写），才用逃�
    - **收尾（两路径通用）**：绑定中用 `exit(action="remove", confirm_remove=true, delete_branch=true)`；
      已退出用 `remove` 子命令 `{"path": ".worktrees/worktree-<task>", "confirm_remove": true, "delete_branch": true}`。
      均为：删副本目录 + 清理已合并分支（`git branch -d` 仅删已合并，未合并会保留并提示）。
+     清理前会**全量扫描并摘除副本内所有 symlink/junction**（含手工创建未声明的），链接目标不受影响。
 
-6. **不进 worktree、直接改主 checkout**（最常见情况）：
+6. **收尾债盘点与死绑定回收**（多会话并行/长期运行的仓库建议定期执行）：
+   - `status` 的"收尾盘点"小节列出：已合并可清理副本、孤儿目录（不在 git 注册表）、
+     无副本的 `worktree-*` 分支——逐项用 `remove` 收尾即可。
+   - 会话异常结束会遗留绑定（ZCode 无会话结束钩子），`status` 会打 `⚠️ stale` 标注；
+     `prune` 一键回收（默认清理静默超 24h 的会话绑定与副本已消失的绑定）。
+   - remove/exit(remove) 遇到死绑定不会被阻断，会自动忽略并回收。
+
+7. **不进 worktree、直接改主 checkout**（最常见情况）：
    - 默认就是允许的，直接用 Write/Edit/git 操作即可，无需任何授权。
    - `git push` 到 master/main 仍需 `authorize-main` → push → `revoke-main`（安全网）。
 

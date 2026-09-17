@@ -2316,3 +2316,332 @@ describe("P. v0.4.4 remove / TTL / 拦截文案", () => {
     spawnSync("git", ["branch", "-D", "worktree-p20-left"], { cwd: repo, encoding: "utf8" });
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Q. v0.4.5（issues #3-#7）: 链接全量扫描 + exit 目标闸门 + 死绑定回收/prune
+//     + 文件锁指引 + status 收尾盘点
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Q. v0.4.5 issues #3-#7", () => {
+  const isWin = process.platform === "win32";
+  const bindFile = (common, sid) => path.join(common, "worktree-guard", "bindings", `${sid}.json`);
+
+  /** 构造仅含 prune/死会话判定所需列的 ZCode 会话 DB，返回可作 ZCODE_STORAGE_DIR 的根目录 */
+  function makeSessionDb(entries) {
+    let DatabaseSync;
+    try { ({ DatabaseSync } = esmRequire("node:sqlite")); } catch { return null; }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wtg-db-"));
+    const dbDir = path.join(dir, "cli", "db");
+    fs.mkdirSync(dbDir, { recursive: true });
+    const db = new DatabaseSync(path.join(dbDir, "db.sqlite"));
+    db.exec("CREATE TABLE session (id text primary key, parent_id text, time_updated integer)");
+    const ins = db.prepare("INSERT INTO session (id, parent_id, time_updated) VALUES (?, ?, ?)");
+    for (const e of entries) ins.run(e.id, e.parent_id ?? null, e.timeUpdated ?? Date.now());
+    db.close();
+    return dir;
+  }
+
+  /** 在 target 处创建指向 shared 的目录链接（Windows junction / 其他平台 dir symlink），失败返回 false */
+  function makeDirLink(shared, target) {
+    try {
+      fs.symlinkSync(shared, target, isWin ? "junction" : "dir");
+      return true;
+    } catch {
+      return false; // 沙箱/CI 无 symlink 权限
+    }
+  }
+
+  // --- #3：链接保护升级（全量扫描） ---
+
+  it("Q01: 🔴 未声明 junction 也在 remove 前被全量摘除——链接目标内容完整（issue #3）", () => {
+    const repo = makeRepo();
+    try {
+      // 共享目标目录（仓库外）+ 副本内手工建链接（不写入 config symlink_dirs）
+      const shared = fs.mkdtempSync(path.join(os.tmpdir(), "wtg-shared-"));
+      fs.writeFileSync(path.join(shared, "keep.txt"), "共享数据");
+      // gitignore 语义：git status 不把链接算作未提交改动（真实场景 node_modules 均被忽略）
+      fs.mkdirSync(path.join(repo, ".git", "info"), { recursive: true });
+      fs.appendFileSync(path.join(repo, ".git", "info", "exclude"), "\nnode_modules/\n");
+      const env = { ZCODE_SESSION_ID: "sess_q01" };
+      runWt("create", { task_name: "q01" }, { env, cwd: repo });
+      const wt = path.join(repo, ".worktrees", "worktree-q01");
+      if (!makeDirLink(shared, path.join(wt, "node_modules"))) return; // 无链接权限跳过
+      runWt("enter", { path: ".worktrees/worktree-q01" }, { env, cwd: repo });
+      const r = runWt("exit", { action: "remove", confirm_remove: true }, { env, cwd: repo });
+      const c = wtContent(r);
+      assert.ok(!c.includes("❌"), `不应失败: ${c.slice(0, 300)}`);
+      assert.ok(c.includes("已安全摘除链接（全量扫描）"), `应提示全量摘除: ${c.slice(0, 300)}`);
+      assert.ok(c.includes("node_modules"), `摘除清单应含链接名: ${c.slice(0, 300)}`);
+      assert.ok(!fs.existsSync(wt), "副本目录应已删除");
+      // 🔴 核心安全断言：链接目标（副本外共享目录）内容完整
+      assert.equal(fs.readFileSync(path.join(shared, "keep.txt"), "utf8"), "共享数据",
+        "未声明链接的目标被穿透删除！");
+      fs.rmSync(shared, { recursive: true, force: true });
+    } finally {
+      cleanupRepo(repo);
+    }
+  });
+
+  it("Q02: linkScanMode 默认 all，sync.link_scan='declared' 回退", () => {
+    assert.equal(C.linkScanMode({}), "all");
+    assert.equal(C.linkScanMode({ sync: {} }), "all");
+    assert.equal(C.linkScanMode({ sync: { link_scan: "declared" } }), "declared");
+    assert.equal(C.linkScanMode({ sync: { link_scan: "bogus" } }), "all");
+  });
+
+  it("Q03: scanAndRemoveAllLinks——嵌套链接摘除、真目录/文件/.git 不动、目标完整", () => {
+    const repo = makeRepo();
+    try {
+      const wt = path.join(repo, ".worktrees", "wt-q03");
+      fs.mkdirSync(path.join(wt, "real-dir", "sub"), { recursive: true });
+      fs.writeFileSync(path.join(wt, "real-dir", "sub", "f.txt"), "x");
+      fs.writeFileSync(path.join(wt, "plain.txt"), "x");
+      fs.writeFileSync(path.join(wt, ".git"), "gitdir: ../.git/worktrees/wt-q03"); // worktree 的 .git 是文件
+      const shared = fs.mkdtempSync(path.join(os.tmpdir(), "wtg-shared-"));
+      fs.writeFileSync(path.join(shared, "keep.txt"), "target-data");
+      if (!makeDirLink(shared, path.join(wt, "node_modules"))) return;
+      if (!makeDirLink(shared, path.join(wt, "real-dir", "sub", "link"))) return;
+      const r = C.scanAndRemoveAllLinks(wt);
+      assert.ok(r.removed.includes("node_modules"), `应摘除顶层链接: ${JSON.stringify(r.removed)}`);
+      assert.ok(r.removed.includes("real-dir/sub/link"), `应摘除嵌套链接: ${JSON.stringify(r.removed)}`);
+      assert.equal(r.failed.length, 0, `不应有失败: ${JSON.stringify(r.failed)}`);
+      assert.ok(fs.existsSync(path.join(wt, "real-dir", "sub", "f.txt")), "真目录内容不应被动");
+      assert.ok(fs.existsSync(path.join(wt, "plain.txt")), "普通文件不应被动");
+      assert.ok(fs.existsSync(path.join(wt, ".git")), ".git 不应被动");
+      assert.equal(fs.readFileSync(path.join(shared, "keep.txt"), "utf8"), "target-data",
+        "链接目标被穿透删除！");
+      fs.rmSync(shared, { recursive: true, force: true });
+    } finally {
+      cleanupRepo(repo);
+    }
+  });
+
+  // --- #4：exit 目标解析闸门 ---
+
+  it("Q04: exit 显式 path 与绑定一致 → 正常退出", () => {
+    const repo = makeRepo();
+    try {
+      const env = { ZCODE_SESSION_ID: "sess_q04" };
+      runWt("create", { task_name: "q04" }, { env, cwd: repo });
+      runWt("enter", { path: ".worktrees/worktree-q04" }, { env, cwd: repo });
+      const r = runWt("exit", { action: "keep", path: ".worktrees/worktree-q04" }, { env, cwd: repo });
+      const c = wtContent(r);
+      assert.ok(!c.includes("❌"), `不应失败: ${c.slice(0, 300)}`);
+      assert.ok(c.includes("绑定已清除"), `应正常退出: ${c.slice(0, 300)}`);
+    } finally {
+      cleanupRepo(repo);
+    }
+  });
+
+  it("Q05: exit 显式 path 与绑定不一致 → 拒绝（绝不静默改目标）", () => {
+    const repo = makeRepo();
+    try {
+      const env = { ZCODE_SESSION_ID: "sess_q05" };
+      runWt("create", { task_name: "q05a" }, { env, cwd: repo });
+      runWt("create", { task_name: "q05b" }, { env, cwd: repo });
+      runWt("enter", { path: ".worktrees/worktree-q05a" }, { env, cwd: repo });
+      const r = runWt("exit", { action: "keep", path: ".worktrees/worktree-q05b" }, { env, cwd: repo });
+      assertWtFail(r, "不一致");
+      // 两目录都未被误动
+      assert.ok(fs.existsSync(path.join(repo, ".worktrees", "worktree-q05b")), "目标目录不应被动");
+    } finally {
+      cleanupRepo(repo);
+    }
+  });
+
+  it("Q06: 🔴 exit 无绑定 + remove 无 path → 拒绝从 state.json 猜测目标（issue #4 核心）", () => {
+    const repo = makeRepo();
+    try {
+      const common = repoCommon(repo);
+      const envA = { ZCODE_SESSION_ID: "sess_q06a" };
+      runWt("create", { task_name: "q06" }, { env: envA, cwd: repo });
+      runWt("enter", { path: ".worktrees/worktree-q06" }, { env: envA, cwd: repo });
+      // 模拟绑定已消失但 state.json 留存（如死会话被清理）
+      fs.unlinkSync(bindFile(common, "sess_q06a"));
+      const wt = path.join(repo, ".worktrees", "worktree-q06");
+      const r = runWt("exit", { action: "remove", confirm_remove: true },
+        { env: { ZCODE_SESSION_ID: "sess_q06b" }, cwd: repo });
+      assertWtFail(r, "不再从 state.json 猜测删除目标");
+      assert.ok(wtContent(r).includes("remove 子命令"), `应指引 remove 子命令: ${wtContent(r).slice(0, 300)}`);
+      assert.ok(fs.existsSync(wt), "state 指向的副本不应被误删");
+    } finally {
+      cleanupRepo(repo);
+    }
+  });
+
+  it("Q07: exit 无绑定 + keep + state 留存 → 仍按 state 汇报（回退保留，无害）", () => {
+    const repo = makeRepo();
+    try {
+      const common = repoCommon(repo);
+      const envA = { ZCODE_SESSION_ID: "sess_q07a" };
+      runWt("create", { task_name: "q07" }, { env: envA, cwd: repo });
+      runWt("enter", { path: ".worktrees/worktree-q07" }, { env: envA, cwd: repo });
+      fs.unlinkSync(bindFile(common, "sess_q07a"));
+      const r = runWt("exit", { action: "keep" }, { env: { ZCODE_SESSION_ID: "sess_q07b" }, cwd: repo });
+      const c = wtContent(r);
+      assert.ok(!c.includes("❌"), `不应失败: ${c.slice(0, 300)}`);
+      assert.ok(c.includes("worktree-q07"), `应按 state 汇报: ${c.slice(0, 300)}`);
+    } finally {
+      cleanupRepo(repo);
+    }
+  });
+
+  it("Q08: exit 无绑定 + 显式 path（已注册）+ remove → 收尾成功", () => {
+    const repo = makeRepo();
+    try {
+      runWt("create", { task_name: "q08" }, { cwd: repo }); // 全程无 enter：无绑定、无 state
+      const r = runWt("exit", { action: "remove", confirm_remove: true, delete_branch: true, path: ".worktrees/worktree-q08" },
+        { env: { ZCODE_SESSION_ID: "sess_q08" }, cwd: repo });
+      const c = wtContent(r);
+      assert.ok(!c.includes("❌"), `不应失败: ${c.slice(0, 300)}`);
+      assert.ok(c.includes("副本目录已删除"), `应删目录: ${c.slice(0, 300)}`);
+      assert.ok(!fs.existsSync(path.join(repo, ".worktrees", "worktree-q08")), "目录应已删除");
+    } finally {
+      cleanupRepo(repo);
+    }
+  });
+
+  // --- #5：死绑定豁免 / 标注 / prune ---
+
+  it("Q09: 🔴 stale 绑定（副本已被手动 remove）不再阻断清理，绑定文件被回收（issue #5③）", () => {
+    const repo = makeRepo();
+    try {
+      const common = repoCommon(repo);
+      const envGhost = { ZCODE_SESSION_ID: "sess_q09ghost" };
+      runWt("create", { task_name: "q09" }, { env: envGhost, cwd: repo });
+      runWt("enter", { path: ".worktrees/worktree-q09" }, { env: envGhost, cwd: repo });
+      // 副本被外部强制移除（目录 + 注册表消失），ghost 绑定残留
+      spawnSync("git", ["worktree", "remove", "--force", path.join(repo, ".worktrees", "worktree-q09")],
+        { cwd: repo, encoding: "utf8" });
+      // 形态②分支残留 + 死绑定 → 应放行而非"仍被其他会话绑定"拒绝
+      const r = runWt("remove", { path: ".worktrees/worktree-q09", confirm_remove: true, delete_branch: true },
+        { env: { ZCODE_SESSION_ID: "sess_q09b" }, cwd: repo });
+      const c = wtContent(r);
+      assert.ok(!c.includes("❌"), `死绑定不应阻断: ${c.slice(0, 300)}`);
+      assert.ok(c.includes("已忽略并回收死绑定"), `应注明忽略死绑定: ${c.slice(0, 300)}`);
+      assert.ok(!fs.existsSync(bindFile(common, "sess_q09ghost")), "死绑定文件应被回收");
+      const br = spawnSync("git", ["branch", "--list", "worktree-q09"], { cwd: repo, encoding: "utf8" });
+      assert.equal((br.stdout || "").trim(), "", "已合并分支应已删除");
+    } finally {
+      cleanupRepo(repo);
+    }
+  });
+
+  it("Q10: 🔴 死会话绑定（DB 静默超阈）不再阻断 remove（issue #5①）", () => {
+    const repo = makeRepo();
+    const storage = makeSessionDb([{ id: "sess_q10ghost", timeUpdated: Date.now() - 48 * 3600000 }]);
+    try {
+      if (!storage) return; // node:sqlite 不可用则跳过
+      const envGhost = { ZCODE_SESSION_ID: "sess_q10ghost" };
+      runWt("create", { task_name: "q10" }, { env: envGhost, cwd: repo });
+      runWt("enter", { path: ".worktrees/worktree-q10" }, { env: envGhost, cwd: repo });
+      const r = runWt("remove", { path: ".worktrees/worktree-q10", confirm_remove: true, delete_branch: true },
+        { env: { ZCODE_SESSION_ID: "sess_q10b", ZCODE_STORAGE_DIR: storage }, cwd: repo });
+      const c = wtContent(r);
+      assert.ok(!c.includes("❌"), `死会话绑定不应阻断: ${c.slice(0, 300)}`);
+      assert.ok(c.includes("已忽略并回收死绑定"), `应注明忽略: ${c.slice(0, 300)}`);
+      assert.ok(c.includes("会话已静默"), `死因应是会话静默: ${c.slice(0, 300)}`);
+      assert.ok(!fs.existsSync(path.join(repo, ".worktrees", "worktree-q10")), "目录应已删除");
+    } finally {
+      cleanupRepo(repo);
+      if (storage) fs.rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  it("Q11: prune——dry_run 仅盘点；实删清死绑定、保留活跃/未知", () => {
+    const repo = makeRepo();
+    const storage = makeSessionDb([
+      { id: "sess_q11dead", timeUpdated: Date.now() - 48 * 3600000 },
+      { id: "sess_q11alive", timeUpdated: Date.now() },
+    ]);
+    try {
+      if (!storage) return;
+      const common = repoCommon(repo);
+      const env = { ZCODE_STORAGE_DIR: storage };
+      runWt("create", { task_name: "q11dead" }, { env: { ZCODE_SESSION_ID: "sess_q11dead" }, cwd: repo });
+      runWt("enter", { path: ".worktrees/worktree-q11dead" }, { env: { ZCODE_SESSION_ID: "sess_q11dead" }, cwd: repo });
+      runWt("create", { task_name: "q11alive" }, { env: { ZCODE_SESSION_ID: "sess_q11alive" }, cwd: repo });
+      runWt("enter", { path: ".worktrees/worktree-q11alive" }, { env: { ZCODE_SESSION_ID: "sess_q11alive" }, cwd: repo });
+      runWt("create", { task_name: "q11unknown" }, { env: { ZCODE_SESSION_ID: "sess_q11unknown" }, cwd: repo });
+      runWt("enter", { path: ".worktrees/worktree-q11unknown" }, { env: { ZCODE_SESSION_ID: "sess_q11unknown" }, cwd: repo });
+      // stale 形态：q11unknown 副本被强制移除，绑定残留（DB 无记录，但目标已消失 → 死）
+      spawnSync("git", ["worktree", "remove", "--force", path.join(repo, ".worktrees", "worktree-q11unknown")],
+        { cwd: repo, encoding: "utf8" });
+
+      const dry = runWt("prune", { dry_run: true }, { env, cwd: repo });
+      const dc = wtContent(dry);
+      assert.ok(dc.includes("仅盘点未删除"), `dry_run 应仅盘点: ${dc.slice(0, 300)}`);
+      assert.ok(dc.includes("sess_q11dead") && dc.includes("sess_q11unknown"), `应列出死绑定: ${dc.slice(0, 400)}`);
+      for (const sid of ["sess_q11dead", "sess_q11alive", "sess_q11unknown"]) {
+        assert.ok(fs.existsSync(bindFile(common, sid)), `dry_run 不应删除 ${sid}`);
+      }
+
+      const pr = runWt("prune", {}, { env, cwd: repo });
+      const pc = wtContent(pr);
+      assert.ok(pc.includes("已清理 2 条死绑定"), `应清理 2 条: ${pc.slice(0, 400)}`);
+      assert.ok(!fs.existsSync(bindFile(common, "sess_q11dead")), "死会话绑定应被清理");
+      assert.ok(!fs.existsSync(bindFile(common, "sess_q11unknown")), "stale 绑定应被清理");
+      assert.ok(fs.existsSync(bindFile(common, "sess_q11alive")), "活跃会话绑定应保留");
+    } finally {
+      cleanupRepo(repo);
+      if (storage) fs.rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  // --- #7：status 收尾盘点 + stale 标注 ---
+
+  it("Q12: status 收尾盘点——已合并可清理/孤儿目录/无副本分支（issue #7）", () => {
+    const repo = makeRepo();
+    try {
+      runWt("create", { task_name: "q12a" }, { cwd: repo }); // 无新提交 → 已合并、干净
+      runWt("create", { task_name: "q12b" }, { cwd: repo });
+      spawnSync("git", ["commit", "-q", "--allow-empty", "-m", "w"],
+        { cwd: path.join(repo, ".worktrees", "worktree-q12b"), encoding: "utf8" }); // 未合并
+      runWt("create", { task_name: "q12c" }, { cwd: repo });
+      spawnSync("git", ["worktree", "remove", "--force", path.join(repo, ".worktrees", "worktree-q12c")],
+        { cwd: repo, encoding: "utf8" }); // 分支残留
+      fs.mkdirSync(path.join(repo, ".worktrees", "orphan-dir"), { recursive: true }); // 孤儿目录
+      const r = runWt("status", {}, { cwd: repo });
+      const c = wtContent(r);
+      assert.ok(c.includes("收尾盘点"), `应有盘点节: ${c.slice(0, 200)}`);
+      assert.ok(c.includes("已合并进 master、工作区干净"), `应标注可清理: ${c.slice(0, 600)}`);
+      assert.ok(c.includes("worktree-q12a"), `应含 q12a: ${c.slice(0, 600)}`);
+      assert.ok(!c.includes("[worktree-q12b] ✅"), `未合并副本不应标可清理: ${c.slice(0, 600)}`);
+      assert.ok(c.includes("孤儿目录") && c.includes("orphan-dir"), `应列出孤儿目录: ${c.slice(0, 600)}`);
+      assert.ok(c.includes("worktree-q12c") && c.includes("无对应副本"), `应列出无副本分支: ${c.slice(0, 600)}`);
+    } finally {
+      cleanupRepo(repo);
+    }
+  });
+
+  it("Q13: status 对 stale 绑定打标注（issue #5②）", () => {
+    const repo = makeRepo();
+    try {
+      const envGhost = { ZCODE_SESSION_ID: "sess_q13ghost" };
+      runWt("create", { task_name: "q13" }, { env: envGhost, cwd: repo });
+      runWt("enter", { path: ".worktrees/worktree-q13" }, { env: envGhost, cwd: repo });
+      spawnSync("git", ["worktree", "remove", "--force", path.join(repo, ".worktrees", "worktree-q13")],
+        { cwd: repo, encoding: "utf8" });
+      const r = runWt("status", {}, { env: { ZCODE_SESSION_ID: "sess_q13other" }, cwd: repo });
+      const c = wtContent(r);
+      assert.ok(c.includes("stale"), `应打 stale 标注: ${c.slice(0, 400)}`);
+      assert.ok(c.includes("prune 可清理"), `应指引 prune: ${c.slice(0, 400)}`);
+    } finally {
+      cleanupRepo(repo);
+    }
+  });
+
+  // --- #6：文件锁失败识别（处置指引的判定函数） ---
+
+  it("Q14: isLockError 识别文件锁类失败输出（issue #6）", () => {
+    assert.ok(C.isLockError("fatal: unable to unlink 'x': Device or resource busy"));
+    assert.ok(C.isLockError("error: could not delete 'x': EPERM: operation not permitted"));
+    assert.ok(C.isLockError("rm: cannot remove 'x': The process cannot access the file because it is being used by another process."));
+    assert.ok(C.isLockError("error: Access is denied."));
+    assert.ok(C.isLockError("无法删除: 另一个程序正在使用此文件"));
+    assert.ok(!C.isLockError("fatal: invalid reference: foo"));
+    assert.ok(!C.isLockError(""));
+    assert.ok(!C.isLockError(undefined));
+  });
+});
+

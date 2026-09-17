@@ -2,6 +2,88 @@
 
 本文件记录 zcode-worktree-guard 的版本演进。详细设计见 [docs/design.md](docs/design.md)。
 
+## [0.4.5] — 2026-09-17
+
+### 背景：issues #3-#7（清理链路的安全与生命周期反馈）
+
+五位使用者的实测反馈，本版按评估结论逐条处理：#3 链接穿透（高危）、#4 exit 猜测删除
+目标（高危）、#5 死会话绑定无回收、#6 文件锁半成功缺指引、#7 status 缺收尾盘点。
+#5 的根治方案（SessionEnd 钩子）经核实不可行——ZCode 插件 hook 仅支持 SessionStart/
+UserPromptSubmit/PreToolUse/PermissionRequest/PostToolUse/PostToolUseFailure/Stop 七种
+事件（`Stop` 每轮回复结束都触发，不能当会话结束用），改为"死会话判定 + prune + stale
+标注"组合。
+
+### 修复：remove 前全量摘除副本内链接——未声明的 junction 不再穿透（issue #3）
+
+`cleanupWorktree()` 此前只摘 config 声明的 `symlink_dirs`；agent/用户手工创建的
+junction/symlink（`mklink /J`、`New-Item -ItemType Junction`——Windows 共享大体积依赖
+的常规操作）不在保护范围，`git worktree remove` 的递归删除会跟随链接**删掉目标目录的
+内容**（目标通常在副本之外：共享缓存/工具链/主 checkout）。现在 `git worktree remove`
+之前对副本目录树做**全量 lstat 扫描**（跳过 `.git`），发现任何链接一律先 unlink
+（`lstatSync().isSymbolicLink()` 对 junction 同样为 true；unlink 不跟随不递归）——目录
+本来就要整体删除，先摘链接严格更安全。摘除清单进回执供审计。性能敏感场景
+（pnpm 式符号链接农场）可配 `sync.link_scan: "declared"` 回退仅摘声明项（v0.4.4 行为）。
+
+### 修复：exit 接受显式 path，remove 不再从 state.json 猜目标（issue #4）
+
+`exit` 从不读 `path` 参数；无绑定时（exit-first 流）`action=remove` 回退用 state.json
+记录的"最近活动 worktree"当删除目标——而 state 是**仓库级单文件，任何会话的 enter 都会
+覆写它**，清理请求可能落到无关副本上（实测仅靠悬空检查侥幸未误删）。现在：
+
+- `exit` 接受显式 `path`：有绑定时须与绑定一致（不一致报错，绝不静默改目标）；无绑定时
+  须是本仓库已注册副本；
+- 无绑定 + `action=remove` 且不传 `path` → 直接拒绝，指引改用 `remove` 子命令；
+- `keep` 的 state 回退保留（仅汇报用途，无害）。
+
+### 新增：死绑定回收——判定豁免 + stale 标注 + prune 子命令（issue #5）
+
+绑定文件只在该会话自己 exit/remove 时清除；会话异常结束/上下文耗尽/被直接关闭后绑定
+**永久残留**，把 `findBindingsForWorktree()` 的"其他会话绑定"检查变成永久阻断。兜底：
+
+- **死会话判定**（`common.deadBindingReason`）：①绑定指向的副本目录与 git 注册表均已
+  消失；或 ②所属会话在 ZCode DB 有记录、但 `time_updated`（每轮回复刷新）已静默超过
+  阈值（默认 24h）。DB 无记录（cli-manual、DB 不可用）保守视为活——判定失败方向是
+  "继续阻断"，不会误豁免。
+- **不阻断**：`exit(remove)` / `remove` 遇死绑定不再拒绝，就地回收绑定文件并在回执留痕
+  （`已忽略并回收死绑定: <sid>（<死因>）`）。
+- **标注**：`status` 对死绑定打 `⚠️ stale: <死因>（prune 可清理）`。
+- **`prune` 子命令**：按同一判定显式清理全部死绑定，输出清理清单；`{"dry_run":true}`
+  仅盘点，`idle_hours` 可调静默阈值（默认 24）。
+
+### 新增：Windows 文件锁失败的处置指引（issue #6）
+
+`git worktree remove` 在 Windows 下可能半成功（git 已注销注册、目录删除被构建 daemon/
+IDE/文件监视器打断），首次失败的回执只有一行原始输出，调用方无从知道"关掉占用进程重试
+即可命中容错路径"。现在识别 `EPERM`/`being used by another process`/`Access is denied`
+等文件锁特征（`common.isLockError`），失败回执直接给出三步处置：关占用进程重试 → 重试
+报 "is not a working tree" 属预期 → 残留目录可手动删除（链接已预摘除，不会穿透）。
+`force_residual` 类接管删除方案评估后不做：手动删除一步之遥，接管删除扩大破坏面。
+
+### 新增：status 收尾盘点（issue #7）
+
+长期多会话并行的仓库必然累积收尾债，此前全部依赖人工发现。`status` 新增"收尾盘点"小节：
+
+- **已合并可清理副本**：注册副本的分支已完全合入默认分支（`git branch --merged`，默认
+  分支经 origin/HEAD → master → main 探测）且工作区干净 → 标注 `✅ 可 remove 收尾`；
+- **孤儿目录**：worktree 父目录下、不在 git 注册表的目录（半删除残留等）；
+- **无副本的 `worktree-*` 分支**：目录已删分支残留，标注可用 remove 子命令清理。
+
+### 测试
+
+`tests/v2.test.mjs` 新增 Q 组 14 用例：Q01/Q03 链接全量扫描（端到端穿透防护 + 嵌套
+链接/`.git` 跳过单元）、Q02 linkScanMode、Q04-Q08 exit 目标闸门（一致/不一致/无绑定
+remove 拒绝/keep 回退保留/无绑定显式 path 收尾）、Q09-Q11 死绑定（stale 豁免、DB 静默
+豁免——用 `ZCODE_STORAGE_DIR` 指向构造 DB 做确定性测试、prune dry_run/实删/保留）、
+Q12/Q13 status 盘点与 stale 标注、Q14 isLockError。全量 **194 用例全绿**（既有 180
+零翻转）。实现中还修复了分支名列表解析漏剥 `+ `/`- ` 行首标记（被其他 worktree 检出/
+离线）的 bug——该 bug 会让盘点把 `worktree-*` 分支误判为无副本。
+
+### 文档
+
+README（特性表、工作流速览、`sync.link_scan` 配置、prune/死绑定说明）、SKILL.md（exit
+path、prune 命令、收尾流程补盘点与死绑定回收）、commands/worktree.md（路由表补 prune
+与 exit path）同步更新；拦截文案 footer 的子命令列表补 `prune`。
+
 ## [0.4.4] — 2026-08-25
 
 ### 背景：issue #1（v0.4.2 全生命周期实测反馈）
