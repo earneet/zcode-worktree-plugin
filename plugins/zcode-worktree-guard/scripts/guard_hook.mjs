@@ -61,7 +61,7 @@ function block(reason, ctx, remedy) {
   if (ctx.command) {
     L.push("⚠️ 组合命令（A && B / A; B）在执行前被整条静态检查——authorize/exit 不会先于拦截生效，请拆开分步执行。");
   }
-  L.push(`（脚本: node "${WT_TOOL}" <create|enter|exit|remove|status|allow|authorize-main|revoke-main>，stdin 传 JSON）`);
+  L.push(`（脚本: node "${WT_TOOL}" <create|enter|exit|remove|prune|status|allow|authorize-main|revoke-main>，stdin 传 JSON）`);
   process.stderr.write("\n" + L.join("\n") + "\n");
   process.exit(2);
 }

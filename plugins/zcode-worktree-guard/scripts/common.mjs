@@ -200,6 +200,34 @@ export function aheadSummary(p, base) {
   return { count: lines.length, sample: lines.slice(0, 10) };
 }
 
+// ---------------------------------------------------------------------------
+// v0.4.5 收尾盘点辅助（issue #7）：默认分支探测 + 已合并分支集合
+
+export function detectDefaultBranch(root) {
+  // origin/HEAD 是远端跟踪口径（最准确）；无远端时回落本地 master → main；都没有 → null。
+  const r = runGit(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], root);
+  if (r.code === 0 && r.stdout) {
+    const b = r.stdout.replace(/^origin\//, "").trim();
+    if (b && b.toUpperCase() !== "HEAD") return b;
+  }
+  for (const cand of DEFAULT_PROTECTED) {
+    if (runGit(["show-ref", "--verify", "--quiet", `refs/heads/${cand}`], root).code === 0) return cand;
+  }
+  return null;
+}
+
+export function mergedBranchSet(root, base) {
+  // 已合并进 base 的本地分支名集合；git 失败返回 null（调用方降级为"不标注"）。
+  // 行首标记：* 当前分支、+ 被其他 worktree 检出、- 已离线的 worktree——统一剥掉。
+  const r = runGit(["branch", "--merged", base], root);
+  if (r.code !== 0) return null;
+  return new Set(
+    r.stdout.split(/\r?\n/)
+      .map((l) => l.replace(/^[\*\+\-] /, "").trim())
+      .filter(Boolean)
+  );
+}
+
 export function ensureLocalExclude(mainRoot, relPath) {
   const common = gitCommonDir(mainRoot);
   if (!common) return false;
@@ -382,6 +410,73 @@ export function findBindingsForWorktree(common, worktreePath) {
   return listBindings(common)
     .filter((b) => b.worktree && norm(b.worktree) === nWt)
     .map((b) => b.sessionId);
+}
+
+// ---------------------------------------------------------------------------
+// v0.4.5 绑定生命周期回收（issue #5）：
+// ZCode 无 SessionEnd 钩子（hooks 仅支持 SessionStart/UserPromptSubmit/PreToolUse/
+// PermissionRequest/PostToolUse/PostToolUseFailure/Stop，Stop 每轮回复结束都触发、
+// 不能当会话结束用），死会话的绑定文件没有自动回收的挂点。替代方案：
+//   ① status 对死绑定打 stale 标注；
+//   ② exit(remove)/remove 不再被死绑定阻断；
+//   ③ prune 子命令显式清理。
+// "死"的判定（保守）：①绑定指向的副本目录与 git 注册表均已消失；或 ②所属会话在
+// ZCode DB 有记录、但 time_updated（每轮回复都会刷新）已静默超过阈值——会话异常
+// 结束/被关闭后该值不再更新。DB 无记录（cli-manual、DB 不可用、旧会话被清理）→
+// 无法证实死亡，一律视为活（宁可保守阻断，交给 prune 显式处理）。
+
+// 会话静默多久判定为死（默认 24h；prune 可用 idle_hours 覆盖）。
+export const SESSION_IDLE_MS_DEFAULT = 24 * 60 * 60 * 1000;
+
+export function sessionLastActiveMs(sessionId) {
+  // 返回 DB 记录的会话最后活动时刻（ms epoch）；无记录/DB 不可用返回 null。
+  // 与 queryParentId 同一套降级策略：任何异常返回 null（调用方保守处理）。
+  if (!sessionId) return null;
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = esmRequire("node:sqlite"));
+  } catch {
+    return null;
+  }
+  let db;
+  try {
+    db = new DatabaseSync(resolveDbPath(), { readOnly: true, timeout: 2000 });
+  } catch {
+    return null;
+  }
+  try {
+    const row = db.prepare("SELECT time_updated FROM session WHERE id = ?").get(sessionId);
+    return row && Number.isFinite(row.time_updated) ? row.time_updated : null;
+  } catch {
+    return null;
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
+// 死绑定判定：返回 null（活/无法证实）或死因字符串（供回执/stale 标注）。
+export function deadBindingReason(common, root, sessionId, opts = {}) {
+  const idleMs = opts.idleMs ?? SESSION_IDLE_MS_DEFAULT;
+  const b = loadBinding(common, sessionId);
+  if (!b || !b.worktree) return "绑定内容为空";
+  const dirGone = !fs.existsSync(b.worktree) || !fs.statSync(b.worktree).isDirectory();
+  if (dirGone) {
+    let registered = false;
+    try {
+      registered = registeredWorktrees(root).some((w) => norm(w.path) === norm(b.worktree));
+    } catch {
+      return null; // 注册表读取失败 → 无法证实，保守视为活
+    }
+    if (!registered) return "副本已不存在（目录与 git 注册表均已消失）";
+    return null; // 目录没了但注册仍在 → git 仍可管理（半成功形态），不算死
+  }
+  if (sessionId === MANUAL_SESSION_ID) return null; // 终端手工身份无 DB 记录，保守不动
+  const last = sessionLastActiveMs(sessionId);
+  if (last != null && Date.now() - last > idleMs) {
+    const hours = Math.max(1, Math.round((Date.now() - last) / 3600000));
+    return `会话已静默约 ${hours} 小时（超过阈值，视为已结束）`;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -794,4 +889,68 @@ export function removeSyncedLinks(wtPath, symlinkDirs) {
     }
   }
   return { removed, skipped, failed };
+}
+
+// ---------------------------------------------------------------------------
+// v0.4.5 链接保护升级（issue #3）：
+// removeSyncedLinks 只摘 config 声明的 symlink_dirs，agent/用户在副本里手工创建的
+// junction/symlink（mklink /J、New-Item -ItemType Junction 等，Windows 共享大体积
+// 依赖的常规操作）不在保护范围——git worktree remove 的递归删除会跟随链接删掉
+// 目标目录的内容（目标常在 worktree 之外：共享缓存/工具链/主 checkout）。
+// 修复：删除前对副本目录树做全量 lstat 扫描，发现任何链接一律先 unlink。
+// 目录本来就要整体删除，先摘链接严格更安全（不丢信息、不跟随任何目标）。
+
+export function linkScanMode(cfg) {
+  // "all"（默认，全量扫描摘除）| "declared"（仅 config 声明项，v0.4.4 行为，
+  // 供超大符号链接农场等性能敏感场景回退）。
+  const v = cfg && cfg.sync && cfg.sync.link_scan;
+  return v === "declared" ? "declared" : "all";
+}
+
+export function scanAndRemoveAllLinks(wtPath) {
+  // 递归扫描 wtPath，摘除所有 symlink/junction。仅跳过【副本根】的 .git（worktree
+  // 的 .git 是 git 自管的普通文件，且不是链接）——嵌套 .git（vendored 仓库）不跳过：
+  // 其内部的链接同样会被 git worktree remove 的递归删除跟随，须一并摘除。
+  // 返回 { removed, failed }，路径为相对 wtPath 的正斜杠形式。
+  const removed = [], failed = [];
+  const relOf = (p) => path.relative(wtPath, p).split(path.sep).join("/");
+  const walk = (dir, top) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir);
+    } catch (e) {
+      failed.push(`${relOf(dir) || "."}: ${e.message}`);
+      return;
+    }
+    for (const name of entries) {
+      if (top && name === ".git") continue;
+      const p = path.join(dir, name);
+      let st;
+      try {
+        st = fs.lstatSync(p); // 🔴 lstat 不跟随：junction/symlink 在 Windows 上都返回 isSymbolicLink
+      } catch (e) {
+        failed.push(`${relOf(p)}: ${e.message}`);
+        continue;
+      }
+      if (st.isSymbolicLink()) {
+        try {
+          fs.unlinkSync(p); // 🔴 unlink 只删链接本身，不递归不跟随
+          removed.push(relOf(p));
+        } catch (e) {
+          failed.push(`${relOf(p)}: ${e.message}`);
+        }
+      } else if (st.isDirectory()) {
+        walk(p, false);
+      }
+    }
+  };
+  walk(wtPath, true);
+  return { removed, failed };
+}
+
+// v0.4.5（issue #6）：识别 Windows 文件锁类失败——git worktree remove 半成功形态
+// （git 已注销注册、目录删除被进程占用打断）的输出特征。命中时 wt.mjs 给处置指引。
+export function isLockError(text) {
+  return /EPERM|EBUSY|EACCES|being used by another process|Access is denied|Permission denied|Device or resource busy|另一个程序|由另一个进程/i
+    .test(String(text || ""));
 }

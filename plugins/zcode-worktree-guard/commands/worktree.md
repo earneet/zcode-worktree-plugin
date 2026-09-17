@@ -10,13 +10,15 @@ description: 管理 git worktree 工作流（创建/进入/退出/收尾清理/�
 
 | 用户说 | 执行 |
 |---|---|
-| `/worktree status` 或 `/worktree` | `echo '{}' | node <base>/../../scripts/wt.mjs status` |
+| `/worktree status` 或 `/worktree` | `echo '{}' | node <base>/../../scripts/wt.mjs status`（含收尾盘点：已合并可清理副本/孤儿目录/无副本分支） |
 | `/worktree create <task>` | `echo '{"task_name":"<task>"}' | node <base>/../../scripts/wt.mjs create` |
 | `/worktree enter <path>` | `echo '{"path":"<path>"}' | node <base>/../../scripts/wt.mjs enter` |
 | `/worktree exit` | `echo '{"action":"keep"}' | node <base>/../../scripts/wt.mjs exit` |
+| `/worktree exit <path>` | `echo '{"action":"keep","path":"<path>"}' | node <base>/../../scripts/wt.mjs exit`（path 须与本会话绑定一致；无绑定时须是已注册副本） |
 | `/worktree exit remove` | `echo '{"action":"remove","confirm_remove":true}' | node <base>/../../scripts/wt.mjs exit` |
 | `/worktree exit remove delete-branch` | `echo '{"action":"remove","confirm_remove":true,"delete_branch":true}' | node <base>/../../scripts/wt.mjs exit`（合并后收尾：删副本目录 + 清理已合并分支） |
-| `/worktree remove <path>` | `echo '{"path":"<path>","confirm_remove":true,"delete_branch":true}' | node <base>/../../scripts/wt.mjs remove`（已退出后的收尾，无需活动绑定） |
+| `/worktree remove <path>` | `echo '{"path":"<path>","confirm_remove":true,"delete_branch":true}' | node <base>/../../scripts/wt.mjs remove`（已退出后的收尾，无需活动绑定；无绑定的 exit remove 不传 path 会被拒，须用本命令显式指定） |
+| `/worktree prune` | `echo '{}' | node <base>/../../scripts/wt.mjs prune`（回收死会话绑定；`{"dry_run":true}` 仅盘点，`idle_hours` 可调阈值） |
 | `/worktree authorize-main <reason>` | `echo '{"reason":"<reason>"}' | node <base>/../../scripts/wt.mjs authorize-main`（默认 15 分钟自动失效） |
 | `/worktree revoke-main` | `echo '{}' | node <base>/../../scripts/wt.mjs revoke-main` |
 

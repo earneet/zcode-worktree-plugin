@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 // zcode-worktree-guard 生命周期脚本
-// create/enter/exit/remove/status/authorize-main/revoke-main/allow
+// create/enter/exit/remove/prune/status/authorize-main/revoke-main/allow
 // session 级绑定（bindings/<session_id>.json）+ subagent 继承 + 悬空检查。
 // v0.4：默认主副本开放——绑定只由本会话 enter 产生；state.json 仅记录最近活动 + 授权标记。
+// v0.4.5：remove 前全量摘除副本内链接（issue #3）；exit 显式 path + remove 目标闸门
+//        （issue #4）；死绑定豁免/标注 + prune 回收（issue #5，ZCode 无 SessionEnd 钩子）；
+//        文件锁失败处置指引（issue #6）；status 收尾盘点（issue #7）。
 // v0.4.1：会话 id 依赖注入——正常路径下 guard_hook 会给本脚本的 Bash 命令注入
 //        ZCODE_SESSION_ID（见 guard_hook.mjs injectSessionEnv）；env 缺失（终端手工
 //        调用/hook 未生效）时落到 cli-manual，该绑定对 ZCode 会话不可见。
@@ -137,14 +140,32 @@ async function cmdEnter(params, cwd) {
 // 前置（调用方保证）：confirm_remove、脏检查、其他会话绑定检查均已通过。
 // 就地追加输出行；返回 { removedOk }——false 表示 git worktree remove 真失败。
 function cleanupWorktree(root, { wtPath, branch, deleteBranch }, lines) {
-  // 🔴 v0.3 安全清理：先删除 worktree 内的 symlink/junction，再 git worktree remove。
-  // 不先删 junction 直接递归删除可能跟随链接误删主仓库内容（如 node_modules）。
+  // 🔴 链接预摘除（v0.3 起；v0.4.5 升级为全量扫描，issue #3）：
+  // git worktree remove 的递归删除会跟随 junction/symlink 删到链接目标（目标常在
+  // 副本之外：共享缓存/工具链/主 checkout）。v0.4.4 前只摘 config 声明的
+  // symlink_dirs，手工创建的链接（mklink /J 等）不设防、会被穿透。现在默认对副本
+  // 目录树做全量 lstat 扫描，发现任何链接一律先 unlink——目录反正要整体删除，
+  // 先摘链接严格更安全；摘除清单进回执供审计。性能敏感场景（pnpm 式符号链接农场）
+  // 可在 config 配 sync.link_scan="declared" 回退到仅摘声明项。
   const cfg = C.loadConfig(root);
-  const { symlinkDirs } = C.syncConfig(cfg);
-  if (symlinkDirs.length) {
-    const rmLink = C.removeSyncedLinks(wtPath, symlinkDirs);
-    if (rmLink.removed.length) lines.push(`- 已安全移除链接: ${rmLink.removed.join(", ")}`);
-    if (rmLink.failed.length) lines.push(`- ⚠️ 移除链接失败: ${rmLink.failed.join("; ")}`);
+  // linksClean：本次是否做到了"目录内已无未摘除链接"（全量扫描且零失败；目录本身
+  // 不存在时无链接可穿透）。决定后续"残留目录可手动删除"的措辞——declared 模式或
+  // 扫描有失败时，手动删除仍可能穿透残余链接，必须警示而不是打包票。
+  let linksClean = !fs.existsSync(wtPath);
+  if (fs.existsSync(wtPath)) {
+    if (C.linkScanMode(cfg) === "all") {
+      const scan = C.scanAndRemoveAllLinks(wtPath);
+      if (scan.removed.length) lines.push(`- 已安全摘除链接（全量扫描）: ${scan.removed.join(", ")}`);
+      if (scan.failed.length) lines.push(`- ⚠️ 链接扫描/摘除失败: ${scan.failed.join("; ")}`);
+      linksClean = scan.failed.length === 0;
+    } else {
+      const { symlinkDirs } = C.syncConfig(cfg);
+      if (symlinkDirs.length) {
+        const rmLink = C.removeSyncedLinks(wtPath, symlinkDirs);
+        if (rmLink.removed.length) lines.push(`- 已安全移除链接: ${rmLink.removed.join(", ")}`);
+        if (rmLink.failed.length) lines.push(`- ⚠️ 移除链接失败: ${rmLink.failed.join("; ")}`);
+      }
+    }
   }
   let removedOk = false;
   const r = C.runGit(["worktree", "remove", wtPath], root);
@@ -154,9 +175,24 @@ function cleanupWorktree(root, { wtPath, branch, deleteBranch }, lines) {
     // 继续清绑定，目录残留提示手动处理，而不是卡死退出流程。
     if (/is not a working tree/i.test(r.stdout)) {
       lines.push(`⚠️ 副本已不在 git 注册表（可能此前 remove 半成功）；目录若有残留请手动删除。`);
+      if (!linksClean) {
+        lines.push(`   ⚠️ 本次未做全量链接摘除（declared 模式或扫描有失败）——手动删除前请先摘除目录内残余的 junction/symlink。`);
+      }
       removedOk = true;
     } else {
       lines.push(`git worktree remove 失败: ${r.stdout}`);
+      // v0.4.5（issue #6）：Windows 文件锁半成功形态的处置指引——git 可能已注销、
+      // 仅目录删除被占用进程打断；关闭占用后重试即可命中上面的容错路径收尾，
+      // 不必翻源码确认"重试安不安全"。
+      if (C.isLockError(r.stdout)) {
+        lines.push("");
+        lines.push("💡 文件锁处置: git 可能已完成注销，仅目录删除被占用（构建 daemon/IDE/文件监视器）。");
+        lines.push("   1. 关闭占用副本目录的进程后重试本命令；");
+        lines.push("   2. 重试若报 \"is not a working tree\" 属预期（容错路径会继续清绑定与分支）；");
+        lines.push(linksClean
+          ? "   3. 届时残留目录可手动删除——链接已全量预摘除，删除不会穿透到链接目标。"
+          : "   3. 届时残留目录手动删除前，请先摘除其中残余的 junction/symlink（本次未做全量摘除）。");
+      }
       return { removedOk: false };
     }
   } else {
@@ -182,6 +218,25 @@ function cleanupWorktree(root, { wtPath, branch, deleteBranch }, lines) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.4.5（issue #5）：悬空检查拆分活/死绑定。死绑定（副本已消失，或所属会话在
+// ZCode DB 已静默超过阈值——异常结束/被关闭的会话不会回来 exit）不再阻断清理，
+// 就地回收绑定文件并在回执留痕；活绑定照旧拒绝。判定见 common.deadBindingReason。
+function splitBlockers(common, root, wtPath, sessionId) {
+  const blockers = [], deadIgnored = [];
+  for (const s of C.findBindingsForWorktree(common, wtPath)) {
+    if (s === sessionId) continue;
+    const why = C.deadBindingReason(common, root, s);
+    if (why) {
+      deadIgnored.push(`${s}（${why}）`);
+      C.clearBinding(common, s); // 死绑定是失效指针，顺手回收（与 prune 同一判定）
+    } else {
+      blockers.push(s);
+    }
+  }
+  return { blockers, deadIgnored };
+}
+
+// ---------------------------------------------------------------------------
 async function cmdExit(params, cwd) {
   const action = params.action || "keep";
   const confirmRemove = params.confirm_remove || false;
@@ -194,9 +249,52 @@ async function cmdExit(params, cwd) {
   const sessionId = getSessionId();
   const binding = C.loadBinding(common, sessionId);
   const state = C.loadStateByCommon(common);
-  // exit 是显式清理命令：优先用本会话 binding；若 binding 缺失，回退到 state.json
-  // 记录的最近活动 worktree（便于清理/汇报），与 resolveBinding 语义无关。
-  const active = binding || (state ? { worktree: state.path, branch: state.branch, base: state.base } : null);
+
+  // v0.4.5（issue #4）：目标解析——exit 绝不"静默改目标"：
+  //   ① 显式 path + 有绑定 → 必须与绑定一致，不一致报错；
+  //   ② 显式 path + 无绑定 → 必须是本仓库已注册副本（校验后受理）；
+  //   ③ 无 path + 有绑定 → 用绑定（最常见形态）；
+  //   ④ 无 path + 无绑定 + action=remove → 拒绝：state.json 是仓库级共享单文件
+  //      （任何会话的 enter 都会覆写它），不能作为破坏性操作的猜测目标；
+  //   ⑤ 无 path + 无绑定 + keep → 保留 state 回退，仅用于汇报（无害）。
+  const rawPath = (params.path || "").trim();
+  let active = null;
+  if (rawPath) {
+    const absPath = path.isAbsolute(rawPath) ? rawPath : path.join(root, rawPath);
+    if (binding) {
+      if (C.norm(binding.worktree) !== C.norm(absPath)) {
+        return fail(
+          `path (${absPath}) 与本会话绑定 (${binding.worktree}) 不一致，拒绝执行。\n` +
+          "退出绑定中的副本无需传 path；要清理其他副本请用 remove 子命令显式指定。"
+        );
+      }
+      active = binding;
+    } else {
+      const target = C.registeredWorktrees(root)
+        .find((w) => C.norm(w.path) === C.norm(absPath) && C.norm(w.path) !== C.norm(root));
+      if (!target) {
+        return fail(`${absPath} 不是本仓库已注册的 worktree（无绑定会话的 exit 只受理已注册副本）。`);
+      }
+      let branch = target.branch;
+      if (!branch) {
+        const rr = C.runGit(["branch", "--show-current"], target.path);
+        branch = rr.stdout;
+      }
+      const base = C.loadBasesByCommon(common)[branch] || "master";
+      active = { worktree: target.path, branch, base };
+    }
+  } else if (binding) {
+    active = binding;
+  } else if (state && action === "remove") {
+    return fail(
+      "本会话无绑定，exit(action=remove) 不再从 state.json 猜测删除目标——它是仓库级共享记录" +
+      `（当前指向 ${state.path}，可能属于其他会话）。\n` +
+      "请改用 remove 子命令显式传 path: " +
+      `{"path":".worktrees/worktree-<slug>","confirm_remove":true,"delete_branch":true}`
+    );
+  } else if (state) {
+    active = { worktree: state.path, branch: state.branch, base: state.base };
+  }
   if (!active) return fail("当前会话没有活动 worktree。");
 
   const wtPath = active.worktree;
@@ -219,8 +317,11 @@ async function cmdExit(params, cwd) {
     lines.push("⚠️ 副本目录已不存在。");
   }
 
-  // v0.2 悬空检查：其他 session 仍绑定该 worktree？
-  const otherSessions = C.findBindingsForWorktree(common, wtPath).filter((s) => s !== sessionId);
+  // v0.2 悬空检查：其他 session 仍绑定该 worktree？（v0.4.5：死绑定豁免，见 splitBlockers）
+  const { blockers: otherSessions, deadIgnored } = splitBlockers(common, root, wtPath, sessionId);
+  if (deadIgnored.length) {
+    lines.push(`🧹 已忽略并回收死绑定: ${deadIgnored.join("; ")}`);
+  }
   if (otherSessions.length > 0) {
     if (action === "remove") {
       return fail(
@@ -242,7 +343,7 @@ async function cmdExit(params, cwd) {
   if (state && state.path && C.norm(state.path) === C.norm(wtPath)) {
     C.clearStateByCommon(common);
   }
-  lines.push("\n✅ 本会话绑定已清除。");
+  lines.push(binding ? "\n✅ 本会话绑定已清除。" : "\nℹ️ 本会话原无绑定（按显式 path / state 记录执行）。");
   if (action === "keep") {
     lines.push(`📌 报告口径：worktree \`${branch}\` 已就绪，待您确认是否合并。`);
     if (deleteBranch) {
@@ -310,8 +411,11 @@ async function cmdRemove(params, cwd) {
     }
   }
 
-  // 其他会话绑定 → 拒绝（与 exit(remove) 同规矩）
-  const otherSessions = C.findBindingsForWorktree(common, absPath).filter((s) => s !== sessionId);
+  // 其他会话绑定 → 拒绝（与 exit(remove) 同规矩；v0.4.5：死绑定豁免并回收）
+  const { blockers: otherSessions, deadIgnored } = splitBlockers(common, root, absPath, sessionId);
+  if (deadIgnored.length) {
+    lines.push(`🧹 已忽略并回收死绑定: ${deadIgnored.join("; ")}`);
+  }
   if (otherSessions.length > 0) {
     return fail(`worktree ${absPath} 仍被其他会话绑定: ${otherSessions.join(", ")}。请先让那些会话退出。`);
   }
@@ -367,7 +471,11 @@ async function cmdStatus(params, cwd) {
       const manualNote = b.sessionId === C.MANUAL_SESSION_ID
         ? " ⚠️ 无会话环境写入：ZCode 会话内不可见（重写不会生效）；在 ZCode 会话内重新 enter 可修复"
         : "";
-      lines.push(`  ${b.sessionId}: ${b.worktree} [${b.branch}] (${b.source || "?"})${mark}${manualNote}`);
+      // v0.4.5（issue #5）：死绑定标注——指向的副本已消失，或所属会话已静默超阈
+      // （异常结束的会话不会再回来 exit，prune 可显式回收）。
+      const deadWhy = C.deadBindingReason(common, root, b.sessionId);
+      const staleNote = deadWhy ? ` ⚠️ stale: ${deadWhy}（prune 可清理）` : "";
+      lines.push(`  ${b.sessionId}: ${b.worktree} [${b.branch}] (${b.source || "?"})${mark}${manualNote}${staleNote}`);
     }
   }
 
@@ -386,8 +494,106 @@ async function cmdStatus(params, cwd) {
       ? `最近活动 worktree（仅记录，非绑定）: ${state.path} [${state.branch}]`
       : "最近活动 worktree: 无"
   );
+
+  // v0.4.5（issue #7）：收尾盘点——让"定期盘点收尾债"成为一条命令的事。
+  // 三类常态残留：①已合并可清理副本（分支完全合入默认分支 + 工作区干净）；
+  // ②孤儿目录（worktree 父目录下、但不在 git 注册表——半删除残留等）；
+  // ③无注册副本对应的 <prefix>* 分支（目录已删分支残留）。
+  lines.push("", "收尾盘点:");
+  const cfg = C.loadConfig(root);
+  const prefix = C.branchPrefix(cfg);
+  const wts = C.registeredWorktrees(root);
+  const invLines = [];
+  const dflt = C.detectDefaultBranch(root);
+  const merged = dflt ? C.mergedBranchSet(root, dflt) : null;
+  if (merged) {
+    const { symlinkDirs } = C.syncConfig(cfg);
+    for (const wt of wts) {
+      if (C.norm(wt.path) === C.norm(root) || !wt.branch || !merged.has(wt.branch)) continue;
+      let dirOk = false;
+      try { dirOk = fs.existsSync(wt.path) && fs.statSync(wt.path).isDirectory(); } catch { dirOk = false; }
+      if (!dirOk) continue;
+      // 脏检查失败（副本损坏，如 .git 文件丢失）只降级标注该条，不让整个 status 崩掉
+      // ——status 是排障入口，必须比被盘点的对象更健壮。
+      let dirtyCount = -1;
+      try { dirtyCount = C.dirtySummary(wt.path, symlinkDirs).count; } catch { dirtyCount = -1; }
+      if (dirtyCount === -1) {
+        invLines.push(`- ${wt.path} [${wt.branch}] 已合并进 ${dflt}，但脏检查失败（副本可能损坏）→ 人工确认后再收尾`);
+      } else if (dirtyCount === 0) {
+        invLines.push(`- ${wt.path} [${wt.branch}] ✅ 已合并进 ${dflt}、工作区干净 → 可 remove 收尾`);
+      } else {
+        invLines.push(`- ${wt.path} [${wt.branch}] 已合并进 ${dflt}，但有 ${dirtyCount} 个未提交改动 → 提交后再收尾`);
+      }
+    }
+  }
+  const parentDir = path.join(root, C.worktreeParent(cfg));
+  if (fs.existsSync(parentDir)) {
+    const regSet = new Set(wts.map((w) => C.norm(w.path)));
+    for (const name of fs.readdirSync(parentDir)) {
+      const p = path.join(parentDir, name);
+      try {
+        if (!fs.statSync(p).isDirectory()) continue;
+      } catch { continue; }
+      if (!regSet.has(C.norm(p))) {
+        invLines.push(`- ${p} ⚠️ 孤儿目录（不在 git worktree 注册表）→ 确认无用后可手动删除`);
+      }
+    }
+  }
+  const wtBranches = new Set(wts.map((w) => w.branch).filter(Boolean));
+  const lb = C.runGit(["branch", "--list", `${prefix}*`], root);
+  for (const raw of (lb.stdout || "").split(/\r?\n/)) {
+    // 行首标记：* 当前分支、+ 被其他 worktree 检出——剥掉（同 mergedBranchSet）。
+    const name = raw.replace(/^[\*\+\-] /, "").trim();
+    if (!name || wtBranches.has(name)) continue;
+    invLines.push(`- 分支 ${name} 🌿 无对应副本 → remove 子命令可清分支残留（git branch -d 仅删已合并）`);
+  }
+  if (invLines.length === 0) {
+    lines.push("  （无收尾残留：没有已合并待清理副本、孤儿目录或无副本分支）");
+  } else {
+    lines.push(...invLines);
+  }
+
   const allowExp = C.globalAllowExpiry(common);
   if (allowExp) lines.push(`⚠️ 全局授权: 已启用（authorize-main，至 ${fmtLocal(allowExp)} 本地到期）`);
+  ok(lines.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// v0.4.5（issue #5）：prune 子命令——死会话/失效绑定的显式回收。
+// 清理判定与 remove/exit 的阻断豁免同一套（common.deadBindingReason）：
+//   ① 绑定指向的副本已不存在（目录 + git 注册表均消失）；
+//   ② 所属会话在 ZCode DB 有记录、但已静默超过 idle_hours（默认 24）。
+// DB 无记录的绑定（cli-manual、DB 不可用、会话记录已被清理）保守保留。
+async function cmdPrune(params, cwd) {
+  const { root, common } = C.findGitContextForCwd(cwd);
+  if (!common) return fail("当前目录不在 git 仓库内。");
+  const dryRun = params.dry_run === true;
+  const idleRaw = Number.parseFloat(params.idle_hours ?? "");
+  const idleHours = Number.isFinite(idleRaw) && idleRaw >= 0 ? idleRaw : 24;
+  const idleMs = idleHours * 3600000;
+
+  const dead = [], alive = [];
+  for (const b of C.listBindings(common)) {
+    const why = C.deadBindingReason(common, root, b.sessionId, { idleMs });
+    if (why) dead.push({ sessionId: b.sessionId, worktree: b.worktree, why });
+    else alive.push(b.sessionId);
+  }
+
+  const lines = [`🧹 prune 结果（idle_hours=${idleHours}${dryRun ? "，dry_run" : ""}）:`];
+  if (dead.length === 0) {
+    lines.push("无死绑定可清理。");
+  } else {
+    lines.push(`${dryRun ? "将清理" : "已清理"} ${dead.length} 条死绑定:`);
+    for (const d of dead) lines.push(`- ${d.sessionId}: ${d.worktree}\n  原因: ${d.why}`);
+    if (dryRun) {
+      lines.push("（dry_run=true：仅盘点未删除；去掉 dry_run 执行清理。）");
+    } else {
+      for (const d of dead) C.clearBinding(common, d.sessionId);
+    }
+  }
+  if (alive.length) {
+    lines.push(`保留 ${alive.length} 条（会话仍活跃或无法证实死亡）: ${alive.join(", ")}`);
+  }
   ok(lines.join("\n"));
 }
 
@@ -477,7 +683,7 @@ async function main() {
 
   const handlers = {
     create: cmdCreate, enter: cmdEnter, exit: cmdExit, remove: cmdRemove, status: cmdStatus,
-    "authorize-main": cmdAuthorize, "revoke-main": cmdRevoke, allow: cmdAllow,
+    prune: cmdPrune, "authorize-main": cmdAuthorize, "revoke-main": cmdRevoke, allow: cmdAllow,
   };
   const handler = handlers[action];
   if (!handler) return fail(`未知子命令 '${action}'（可用: ${Object.keys(handlers).join(", ")}）`);

@@ -51,11 +51,14 @@
 | 🔓 **默认主副本开放** | 未 `enter` 时，Write/Edit/本地 git 操作自由放行，不重写不拦截 |
 | 🛡️ **始终生效的安全网** | 跨副本写入、写 `.git`、`git push` 到 master/main、删 worktree 分支一律拦截；有绑定时再加受保护分支 merge/rebase/pull 拦截 |
 | 🧠 **自动纪律注入** | SessionStart hook 让每个会话默认知道 worktree 工作流 |
-| 📦 **完整生命周期** | create / enter / exit / status / authorize-main / revoke-main / allow |
+| 📦 **完整生命周期** | create / enter / exit / remove / prune / status / authorize-main / revoke-main / allow |
 | 🔍 **Bash cd 解析** | 从命令串提取 `cd` 目标，跨会话目录也能定位真实工作位置 |
 | 🔗 **会话级绑定 + 继承** | 每 session 独立绑定，子代理经 DB parent 链自动继承父 worktree |
 | 🚪 **双层逃生口** | 声明式白名单（`main_write_whitelist`）+ 临时 allow 放行（带 TTL + 审计） |
 | 📂 **文件同步** | worktree 创建后自动复制文件（`copy_files`）+ 链接目录（`symlink_dirs`，Windows junction 无需管理员权限） |
+| 🧷 **链接穿透防护** | 清理副本前**全量扫描**目录树、逐个摘除 symlink/junction（含手工创建未声明的），防止 `git worktree remove` 递归删除穿透到链接目标 |
+| ♻️ **死绑定回收** | ZCode 无 SessionEnd 钩子，异常结束的会话绑定由"死会话判定（DB 静默超阈）+ prune 子命令 + status stale 标注"兜底回收，不再永久阻断清理 |
+| 📋 **收尾盘点** | `status` 一条命令盘点收尾债：已合并可清理副本 / 孤儿目录 / 无副本的 `worktree-*` 分支 |
 | 🪶 **零依赖** | 纯 Node.js 标准库（ESM `.mjs`），与 ZCode 同栈 |
 
 ## 安装
@@ -119,11 +122,18 @@ echo '{"action": "remove", "confirm_remove": true, "delete_branch": true}' | nod
 
 # 收尾方式二（已 exit 后再合并——exit-first 流）：remove 子命令，无需活动绑定
 echo '{"path": ".worktrees/worktree-fix-login", "confirm_remove": true, "delete_branch": true}' | node <plugin>/scripts/wt.mjs remove
+
+# 定期盘点收尾债（已合并可清理副本 / 孤儿目录 / 无副本分支）+ 回收死会话绑定
+echo '{}' | node <plugin>/scripts/wt.mjs status
+echo '{}' | node <plugin>/scripts/wt.mjs prune           # 清理死绑定（dry_run:true 仅盘点）
 ```
 
 > `task_name` 必须是小写字母/数字/连字符的 slug（如 `fix-login`），不接受大写/下划线/空格/中文。
 >
 > `authorize-main` 授权默认 **15 分钟自动失效**（`ttl_minutes` 可调），到期后恢复拦截——revoke 不再只靠自觉。
+>
+> `exit` 也接受显式 `path`（须与本会话绑定一致；无绑定时须是已注册副本）。无绑定 + `action=remove`
+> 且不传 `path` 会被拒绝——`state.json` 是仓库级共享记录，不能作为删除目标的猜测来源，请改用 `remove` 子命令。
 
 ## 拦截规则一览
 
@@ -170,7 +180,8 @@ echo '{"path": ".worktrees/worktree-fix-login", "confirm_remove": true, "delete_
 | `protected_branches` | 额外受保护分支（默认含 `master`、`main`） |
 | `main_write_whitelist` | 声明式白名单：这些路径写主目录不重写不拦截（glob 支持 `*`/`**`/`?`）。危险裸根模式（`*`、`/`、`.` 等）会被自动过滤 |
 | `sync.copy_files` | worktree 创建后从主 checkout 复制的文件列表（相对路径，如 `.env`、`package.json`） |
-| `sync.symlink_dirs` | worktree 创建后从主 checkout 链接的目录列表（相对路径，如 `node_modules`）。Windows 用 junction（无需管理员权限），其他平台用 dir symlink。清理 worktree 时先安全移除链接，避免递归删除误删主仓库内容 |
+| `sync.symlink_dirs` | worktree 创建后从主 checkout 链接的目录列表（相对路径，如 `node_modules`）。Windows 用 junction（无需管理员权限），其他平台用 dir symlink |
+| `sync.link_scan` | 清理副本时的链接摘除模式：`"all"`（默认）全量扫描副本目录树、摘除**所有** symlink/junction——包括 `mklink /J` 等手工创建、未在 `symlink_dirs` 声明的链接，防止 `git worktree remove` 递归删除穿透到链接目标（共享缓存/主 checkout 等）；`"declared"` 回退为仅摘除声明项（pnpm 式符号链接农场等性能敏感场景） |
 
 ### 临时放行（allow 逃生口）
 
@@ -190,12 +201,25 @@ echo '{"action":"clear"}' | node <plugin>/scripts/wt.mjs allow   # 清空
 ```
 <git-common-dir>/worktree-guard/
   bindings/       # 会话级绑定（每 session 一文件：<session_id>.json）—— 绑定真值
+                  #   死会话绑定（DB 静默超阈 / 副本已消失）由 prune 回收，不再阻断 remove
   state.json      # 最近一次活动 worktree 记录 + 全局授权标记（非绑定真值）
   bases.json      # 各 worktree 的 base 分支
   allowlist.json  # 临时放行条目（带 TTL，过期自动 GC）
   audit.jsonl     # allow 操作审计日志
   meta.json       # schema 版本（迁移检测）
 ```
+
+### 死会话绑定与 prune
+
+ZCode 没有 SessionEnd 钩子（会话异常结束/被直接关闭时没有回调），绑定文件只在该会话自己
+`exit`/`remove` 时清除。兜底机制（判定见 `common.mjs deadBindingReason`）：
+
+- **死会话判定**：会话在 ZCode DB 有记录、但 `time_updated` 已静默超过阈值（默认 24h，
+  `prune` 可用 `idle_hours` 覆盖）→ 视为已结束；DB 无记录（`cli-manual`、DB 不可用）保守视为活。
+- **不阻断**：`exit(remove)` / `remove` 遇到死绑定（含副本目录与注册表均已消失的 stale 绑定）
+  不再拒绝，就地回收绑定文件并在回执留痕。
+- **标注**：`status` 对死绑定打 `⚠️ stale` 标注。
+- **显式回收**：`prune` 子命令清理全部死绑定（`{"dry_run": true}` 仅盘点不删除）。
 
 不进版本库、所有 worktree 共享（存 git common dir）。绑定只来自本会话 `enter`，不随重启自动恢复（上个会话的 enter 不会延续）。
 
