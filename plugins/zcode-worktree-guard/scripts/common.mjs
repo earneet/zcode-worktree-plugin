@@ -908,11 +908,13 @@ export function linkScanMode(cfg) {
 }
 
 export function scanAndRemoveAllLinks(wtPath) {
-  // 递归扫描 wtPath，摘除所有 symlink/junction（跳过 .git——worktree 的 .git 是
-  // 文件，git 自管，不碰）。返回 { removed, failed }，路径为相对 wtPath 的正斜杠形式。
+  // 递归扫描 wtPath，摘除所有 symlink/junction。仅跳过【副本根】的 .git（worktree
+  // 的 .git 是 git 自管的普通文件，且不是链接）——嵌套 .git（vendored 仓库）不跳过：
+  // 其内部的链接同样会被 git worktree remove 的递归删除跟随，须一并摘除。
+  // 返回 { removed, failed }，路径为相对 wtPath 的正斜杠形式。
   const removed = [], failed = [];
   const relOf = (p) => path.relative(wtPath, p).split(path.sep).join("/");
-  const walk = (dir) => {
+  const walk = (dir, top) => {
     let entries;
     try {
       entries = fs.readdirSync(dir);
@@ -921,7 +923,7 @@ export function scanAndRemoveAllLinks(wtPath) {
       return;
     }
     for (const name of entries) {
-      if (name === ".git") continue;
+      if (top && name === ".git") continue;
       const p = path.join(dir, name);
       let st;
       try {
@@ -938,11 +940,11 @@ export function scanAndRemoveAllLinks(wtPath) {
           failed.push(`${relOf(p)}: ${e.message}`);
         }
       } else if (st.isDirectory()) {
-        walk(p);
+        walk(p, false);
       }
     }
   };
-  walk(wtPath);
+  walk(wtPath, true);
   return { removed, failed };
 }
 

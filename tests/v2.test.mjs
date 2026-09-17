@@ -145,6 +145,10 @@ function makeRepo() {
   spawnSync("git", ["init", "-q", "-b", "master"], { cwd: dir, encoding: "utf8" });
   spawnSync("git", ["config", "user.email", "t@t.com"], { cwd: dir, encoding: "utf8" });
   spawnSync("git", ["config", "user.name", "t"], { cwd: dir, encoding: "utf8" });
+  // 测试仓库隔离：禁用 fsmonitor——本机系统级 core.fsmonitor=true 会让 git 在临时仓库
+  // 里拉起 fsmonitor--daemon（detached 但继承 stdio 管道句柄），spawnSync 等不到管道
+  // EOF 而永久挂起（实测卡死 makeRepo 的 git commit；偶发单用例失败同源）。
+  spawnSync("git", ["config", "core.fsmonitor", "false"], { cwd: dir, encoding: "utf8" });
   spawnSync("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd: dir, encoding: "utf8" });
   return dir;
 }
@@ -2389,7 +2393,7 @@ describe("Q. v0.4.5 issues #3-#7", () => {
     assert.equal(C.linkScanMode({ sync: { link_scan: "bogus" } }), "all");
   });
 
-  it("Q03: scanAndRemoveAllLinks——嵌套链接摘除、真目录/文件/.git 不动、目标完整", () => {
+  it("Q03: scanAndRemoveAllLinks——嵌套链接摘除、真目录/文件/根 .git 不动、嵌套 .git 链接也摘除、目标完整", () => {
     const repo = makeRepo();
     try {
       const wt = path.join(repo, ".worktrees", "wt-q03");
@@ -2401,13 +2405,16 @@ describe("Q. v0.4.5 issues #3-#7", () => {
       fs.writeFileSync(path.join(shared, "keep.txt"), "target-data");
       if (!makeDirLink(shared, path.join(wt, "node_modules"))) return;
       if (!makeDirLink(shared, path.join(wt, "real-dir", "sub", "link"))) return;
+      // 嵌套 .git symlink（vendored 仓库罕见形态）——审查修复后同样摘除（只跳过副本根的 .git）
+      if (!makeDirLink(shared, path.join(wt, "real-dir", ".git"))) return;
       const r = C.scanAndRemoveAllLinks(wt);
       assert.ok(r.removed.includes("node_modules"), `应摘除顶层链接: ${JSON.stringify(r.removed)}`);
       assert.ok(r.removed.includes("real-dir/sub/link"), `应摘除嵌套链接: ${JSON.stringify(r.removed)}`);
+      assert.ok(r.removed.includes("real-dir/.git"), `嵌套 .git 链接也应摘除: ${JSON.stringify(r.removed)}`);
       assert.equal(r.failed.length, 0, `不应有失败: ${JSON.stringify(r.failed)}`);
       assert.ok(fs.existsSync(path.join(wt, "real-dir", "sub", "f.txt")), "真目录内容不应被动");
       assert.ok(fs.existsSync(path.join(wt, "plain.txt")), "普通文件不应被动");
-      assert.ok(fs.existsSync(path.join(wt, ".git")), ".git 不应被动");
+      assert.ok(fs.existsSync(path.join(wt, ".git")), "副本根的 .git 文件不应被动");
       assert.equal(fs.readFileSync(path.join(shared, "keep.txt"), "utf8"), "target-data",
         "链接目标被穿透删除！");
       fs.rmSync(shared, { recursive: true, force: true });
@@ -2642,6 +2649,27 @@ describe("Q. v0.4.5 issues #3-#7", () => {
     assert.ok(!C.isLockError("fatal: invalid reference: foo"));
     assert.ok(!C.isLockError(""));
     assert.ok(!C.isLockError(undefined));
+  });
+
+  // --- 审查修复回归（v0.4.5 自查） ---
+
+  it("Q15: status 盘点对损坏副本降级标注——脏检查失败不拖垮整个 status", () => {
+    const repo = makeRepo();
+    try {
+      runWt("create", { task_name: "q15" }, { cwd: repo });
+      // 损坏副本：.git 文件指向不存在的 gitdir（悬空指针——注意不能直接删文件：
+      // 副本在主仓库内，删掉后 git -C 会向上遍历找到主 .git，静默对主 checkout 求值；
+      // 且该文件带 Git for Windows 特殊属性，直接 write 会 EPERM，须 unlink 后重建）
+      const q15Git = path.join(repo, ".worktrees", "worktree-q15", ".git");
+      fs.unlinkSync(q15Git);
+      fs.writeFileSync(q15Git, "gitdir: ../.git/worktrees/worktree-q15-gone");
+      const r = runWt("status", {}, { cwd: repo });
+      const c = wtContent(r);
+      assert.ok(!c.includes("❌"), `status 不应失败: ${c.slice(0, 300)}`);
+      assert.ok(c.includes("脏检查失败"), `应降级标注而非崩溃: ${c.slice(0, 600)}`);
+    } finally {
+      cleanupRepo(repo);
+    }
   });
 });
 

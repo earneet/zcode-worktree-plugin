@@ -70,13 +70,37 @@ IDE/文件监视器打断），首次失败的回执只有一行原始输出，�
 
 ### 测试
 
-`tests/v2.test.mjs` 新增 Q 组 14 用例：Q01/Q03 链接全量扫描（端到端穿透防护 + 嵌套
-链接/`.git` 跳过单元）、Q02 linkScanMode、Q04-Q08 exit 目标闸门（一致/不一致/无绑定
-remove 拒绝/keep 回退保留/无绑定显式 path 收尾）、Q09-Q11 死绑定（stale 豁免、DB 静默
-豁免——用 `ZCODE_STORAGE_DIR` 指向构造 DB 做确定性测试、prune dry_run/实删/保留）、
-Q12/Q13 status 盘点与 stale 标注、Q14 isLockError。全量 **194 用例全绿**（既有 180
-零翻转）。实现中还修复了分支名列表解析漏剥 `+ `/`- ` 行首标记（被其他 worktree 检出/
-离线）的 bug——该 bug 会让盘点把 `worktree-*` 分支误判为无副本。
+`tests/v2.test.mjs` 新增 Q 组 15 用例：Q01/Q03 链接全量扫描（端到端穿透防护 + 嵌套
+链接/嵌套 `.git` 链接摘除、根 `.git` 与真目录不动的单元）、Q02 linkScanMode、Q04-Q08
+exit 目标闸门（一致/不一致/无绑定 remove 拒绝/keep 回退保留/无绑定显式 path 收尾）、
+Q09-Q11 死绑定（stale 豁免、DB 静默豁免——用 `ZCODE_STORAGE_DIR` 指向构造 DB 做确定
+性测试、prune dry_run/实删/保留）、Q12/Q13 status 盘点与 stale 标注、Q14 isLockError、
+Q15 损坏副本降级标注。全量 **195 用例全绿**（既有 180 零翻转）。实现中还修复了分支名
+列表解析漏剥 `+ `/`- ` 行首标记（被其他 worktree 检出/离线）的 bug——该 bug 会让盘点
+把 `worktree-*` 分支误判为无副本。
+
+### 审查修复（同日，v0.4.5 自查）
+
+- **文件锁指引的"残留目录可手动删除"改为条件化措辞**：原先无条件声称"链接已预摘除、
+  删除不会穿透"——在 `sync.link_scan="declared"` 回退模式或扫描有失败项时是不安全
+  建议（残余链接仍可能被手动删除穿透）。现在只有全量扫描零失败才打包票，否则提示
+  先摘除残余 junction/symlink；"is not a working tree" 容错分支的残留目录提示同口径。
+- **全量链接扫描只跳过副本根的 `.git`**：原先按名字在任意深度跳过——vendored 嵌套
+  仓库内的链接（含嵌套 `.git` 本身是 symlink 的罕见形态）不在保护范围。现在嵌套
+  `.git` 若是链接一律摘除、若是真目录则照常扫描其内容。Q03 补断言。
+- **status 盘点对单个副本的脏检查失败降级标注**：`dirtySummary` 内部 `git status`
+  失败（副本损坏，如 `.git` 指针悬空）原先会让整个 status 以"工具内部错误"崩掉——
+  status 是排障入口，必须比被盘点对象更健壮。现在该条标注"脏检查失败（副本可能
+  损坏）→ 人工确认后再收尾"，其余盘点照常输出。Q15 回归锁（注：损坏形态须用悬空
+  `.git` 指针——直接删 `.git` 文件时 `git -C` 会向上遍历找到主仓库 `.git`、静默对
+  主 checkout 求值，测不出该路径；且该文件带 Git for Windows 特殊属性，改写须
+  unlink 后重建）。
+- **exit 无绑定回执不再谎称"绑定已清除"**：经显式 path / state 回退执行且本会话
+  原无绑定时，改提示"本会话原无绑定"；有绑定时保持原文案（既有断言不变）。
+- **测试夹具隔离（稳定性）**：`makeRepo` 显式 `core.fsmonitor false`——本机系统级
+  `core.fsmonitor=true` 会让 git 在每个临时仓库拉起 detached 的 fsmonitor--daemon，
+  守护进程继承 stdio 管道句柄，把无超时的 `spawnSync` 永久挂起（本轮实测卡死
+  makeRepo 的 `git commit`，kill 后复跑即绿；此前一轮全量跑的偶发单失败同源）。
 
 ### 文档
 

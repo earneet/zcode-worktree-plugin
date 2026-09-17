@@ -148,11 +148,16 @@ function cleanupWorktree(root, { wtPath, branch, deleteBranch }, lines) {
   // 先摘链接严格更安全；摘除清单进回执供审计。性能敏感场景（pnpm 式符号链接农场）
   // 可在 config 配 sync.link_scan="declared" 回退到仅摘声明项。
   const cfg = C.loadConfig(root);
+  // linksClean：本次是否做到了"目录内已无未摘除链接"（全量扫描且零失败；目录本身
+  // 不存在时无链接可穿透）。决定后续"残留目录可手动删除"的措辞——declared 模式或
+  // 扫描有失败时，手动删除仍可能穿透残余链接，必须警示而不是打包票。
+  let linksClean = !fs.existsSync(wtPath);
   if (fs.existsSync(wtPath)) {
     if (C.linkScanMode(cfg) === "all") {
       const scan = C.scanAndRemoveAllLinks(wtPath);
       if (scan.removed.length) lines.push(`- 已安全摘除链接（全量扫描）: ${scan.removed.join(", ")}`);
       if (scan.failed.length) lines.push(`- ⚠️ 链接扫描/摘除失败: ${scan.failed.join("; ")}`);
+      linksClean = scan.failed.length === 0;
     } else {
       const { symlinkDirs } = C.syncConfig(cfg);
       if (symlinkDirs.length) {
@@ -170,6 +175,9 @@ function cleanupWorktree(root, { wtPath, branch, deleteBranch }, lines) {
     // 继续清绑定，目录残留提示手动处理，而不是卡死退出流程。
     if (/is not a working tree/i.test(r.stdout)) {
       lines.push(`⚠️ 副本已不在 git 注册表（可能此前 remove 半成功）；目录若有残留请手动删除。`);
+      if (!linksClean) {
+        lines.push(`   ⚠️ 本次未做全量链接摘除（declared 模式或扫描有失败）——手动删除前请先摘除目录内残余的 junction/symlink。`);
+      }
       removedOk = true;
     } else {
       lines.push(`git worktree remove 失败: ${r.stdout}`);
@@ -181,7 +189,9 @@ function cleanupWorktree(root, { wtPath, branch, deleteBranch }, lines) {
         lines.push("💡 文件锁处置: git 可能已完成注销，仅目录删除被占用（构建 daemon/IDE/文件监视器）。");
         lines.push("   1. 关闭占用副本目录的进程后重试本命令；");
         lines.push("   2. 重试若报 \"is not a working tree\" 属预期（容错路径会继续清绑定与分支）；");
-        lines.push("   3. 届时残留目录可手动删除——链接已预摘除，删除不会穿透到链接目标。");
+        lines.push(linksClean
+          ? "   3. 届时残留目录可手动删除——链接已全量预摘除，删除不会穿透到链接目标。"
+          : "   3. 届时残留目录手动删除前，请先摘除其中残余的 junction/symlink（本次未做全量摘除）。");
       }
       return { removedOk: false };
     }
@@ -333,7 +343,7 @@ async function cmdExit(params, cwd) {
   if (state && state.path && C.norm(state.path) === C.norm(wtPath)) {
     C.clearStateByCommon(common);
   }
-  lines.push("\n✅ 本会话绑定已清除。");
+  lines.push(binding ? "\n✅ 本会话绑定已清除。" : "\nℹ️ 本会话原无绑定（按显式 path / state 记录执行）。");
   if (action === "keep") {
     lines.push(`📌 报告口径：worktree \`${branch}\` 已就绪，待您确认是否合并。`);
     if (deleteBranch) {
@@ -500,11 +510,20 @@ async function cmdStatus(params, cwd) {
     const { symlinkDirs } = C.syncConfig(cfg);
     for (const wt of wts) {
       if (C.norm(wt.path) === C.norm(root) || !wt.branch || !merged.has(wt.branch)) continue;
-      if (!fs.existsSync(wt.path) || !fs.statSync(wt.path).isDirectory()) continue;
-      const dirty = C.dirtySummary(wt.path, symlinkDirs);
-      invLines.push(dirty.count === 0
-        ? `- ${wt.path} [${wt.branch}] ✅ 已合并进 ${dflt}、工作区干净 → 可 remove 收尾`
-        : `- ${wt.path} [${wt.branch}] 已合并进 ${dflt}，但有 ${dirty.count} 个未提交改动 → 提交后再收尾`);
+      let dirOk = false;
+      try { dirOk = fs.existsSync(wt.path) && fs.statSync(wt.path).isDirectory(); } catch { dirOk = false; }
+      if (!dirOk) continue;
+      // 脏检查失败（副本损坏，如 .git 文件丢失）只降级标注该条，不让整个 status 崩掉
+      // ——status 是排障入口，必须比被盘点的对象更健壮。
+      let dirtyCount = -1;
+      try { dirtyCount = C.dirtySummary(wt.path, symlinkDirs).count; } catch { dirtyCount = -1; }
+      if (dirtyCount === -1) {
+        invLines.push(`- ${wt.path} [${wt.branch}] 已合并进 ${dflt}，但脏检查失败（副本可能损坏）→ 人工确认后再收尾`);
+      } else if (dirtyCount === 0) {
+        invLines.push(`- ${wt.path} [${wt.branch}] ✅ 已合并进 ${dflt}、工作区干净 → 可 remove 收尾`);
+      } else {
+        invLines.push(`- ${wt.path} [${wt.branch}] 已合并进 ${dflt}，但有 ${dirtyCount} 个未提交改动 → 提交后再收尾`);
+      }
     }
   }
   const parentDir = path.join(root, C.worktreeParent(cfg));
