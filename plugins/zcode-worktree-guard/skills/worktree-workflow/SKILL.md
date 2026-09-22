@@ -199,6 +199,7 @@ worktree、又想例外写主 checkout 某路径（绕过重写），才用逃�
 | 未 enter，本地 `git merge/rebase/pull/checkout` | ✅ 放行 |
 | 未 enter，`git push` 到 master/main | 🔴 拦截（安全网，需授权） |
 | 有绑定，写主 checkout 路径 | ✅ **自动重写**到 worktree（你无感知） |
+| 有绑定，ApplyPatch 写主 checkout（OpenAI responses 提供方） | ✅ **自动重写**（`operation.path`，与 Write 同表；v0.4.6） |
 | 有绑定，写副本内路径 | ✅ 放行 |
 | 有绑定，Glob/Grep 无 path | ✅ 自动注入 path=worktree |
 | 有绑定/在副本内，写其他副本 | 🔴 拦截（跨副本保护） |
@@ -211,7 +212,7 @@ worktree、又想例外写主 checkout 某路径（绕过重写），才用逃�
 | `authorize-main` 授权期间 | ✅ 全部放行（`.git` 仍拦） |
 | 仓库外路径、非 git 目录 | ✅ 放行 |
 
-已知边界：hook 是 fail-open（脚本异常放行）；bash 命令字符串不被重写（Bash 内用副本相对路径或先 cd，见「Bash 工作流」），只拦危险 git 操作。
+已知边界：hook 是 fail-open（脚本异常放行）；bash 命令字符串不被重写（Bash 内用副本相对路径或先 cd，见「Bash 工作流」），只拦危险 git 操作；ApplyPatch（若提供方暴露）与 Write/Edit 同表重写，但经 MCP 工具（如 node-repl）写盘不在守卫范围——等同 bash 边界，用副本相对路径。
 
 ## 与纪律的对照表
 

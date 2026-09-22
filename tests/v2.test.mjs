@@ -17,6 +17,7 @@
 //   K  鲁棒性 / 边界
 //   N  会话身份贯通（v0.4.1 回归锁）+ Read 去武器化 + MSYS 路径/分支误报
 //   O  git -C 语境解析（v0.4.2 反馈③）+ TTL 本地显示 + exit 容错 + 拦截文案
+//   R  ApplyPatch 分发覆盖（v0.4.6：OpenAI responses 补丁式写工具与 Write 同表决策）
 
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -2670,6 +2671,115 @@ describe("Q. v0.4.5 issues #3-#7", () => {
     } finally {
       cleanupRepo(repo);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// R. v0.4.6 ApplyPatch 分发覆盖
+// 引擎（zcode.cjs）把 OpenAI responses 的 apply_patch_call 转成内部 tool-call
+// "ApplyPatch"，stdin 形状（源码确证）：{callId, operation:{type, path, diff?}}；
+// hook 触发靠引擎 matcher 别名表（ApplyPatch→[Write,Edit]，matchValues 展开命中）。
+// 本组锁定分发层：与 Write 同一 decideWrite 决策表，重写只替换 operation.path。
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("R. v0.4.6 ApplyPatch 分发覆盖", () => {
+  let repo, sid, wtPath, otherWt;
+
+  before(() => {
+    repo = makeRepo();
+    sid = "sess_test_r";
+    const env = { ZCODE_SESSION_ID: sid };
+    runWt("create", { task_name: "feat" }, { env, cwd: repo });
+    runWt("enter", { path: ".worktrees/worktree-feat" }, { env, cwd: repo });
+    runWt("create", { task_name: "other" }, { env: { ZCODE_SESSION_ID: "sess_r_maker" }, cwd: repo });
+    wtPath = path.join(repo, ".worktrees", "worktree-feat");
+    otherWt = path.join(repo, ".worktrees", "worktree-other");
+  });
+  after(() => cleanupRepo(repo));
+
+  /** 构造 ApplyPatch 的 PreToolUse payload（形状对齐引擎 apply_patch_call 转换） */
+  function ap(op, opts = {}) {
+    return {
+      tool_name: "ApplyPatch", cwd: opts.cwd || repo,
+      session_id: opts.sid || sid,
+      tool_input: { callId: opts.callId || "call_r", operation: op },
+    };
+  }
+
+  /** 断言重写落到 operation.path（assertRewrite 只认 file_path/path 字段，不适用） */
+  function assertOpRewrite(r, contains) {
+    assert.equal(r.code, 0, `期望 exit 0（重写），实际 ${r.code}; stderr: ${r.stderr.slice(0, 200)}`);
+    let parsed;
+    try { parsed = JSON.parse(r.stdout); }
+    catch { assert.fail(`stdout 不是 JSON: ${r.stdout.slice(0, 300)}`); }
+    const ui = parsed.hookSpecificOutput?.updatedInput;
+    assert.ok(ui, `缺少 updatedInput: ${r.stdout.slice(0, 300)}`);
+    const p = ui.operation?.path || "";
+    assert.ok(C.norm(p).includes(C.norm(contains)),
+      `重写 operation.path "${p}" 不包含 "${contains}"`);
+    return ui;
+  }
+
+  it("R01: 绑定态 update_file 主 checkout → 重写 operation.path（callId/diff/type 原样保留）", () => {
+    const r = runHook(ap({ type: "update_file", path: path.join(repo, "x.js"), diff: "-1\n+2" }));
+    const ui = assertOpRewrite(r, wtPath);
+    assert.equal(ui.callId, "call_r", "callId 必须原样保留");
+    assert.equal(ui.operation.diff, "-1\n+2", "diff 必须原样保留");
+    assert.equal(ui.operation.type, "update_file", "operation.type 必须原样保留");
+  });
+
+  it("R02: 绑定态 create_file 主 checkout → 重写", () => {
+    const r = runHook(ap({ type: "create_file", path: path.join(repo, "new.txt"), diff: "+hello" }));
+    assertOpRewrite(r, wtPath);
+  });
+
+  it("R03: 绑定态 delete_file 主 checkout → 重写（删除也是写）", () => {
+    const r = runHook(ap({ type: "delete_file", path: path.join(repo, "old.txt") }));
+    assertOpRewrite(r, wtPath);
+  });
+
+  it("R04: 绑定态 update_file 相对路径 → 按会话 cwd 解析后重写", () => {
+    const r = runHook(ap({ type: "update_file", path: "rel.txt", diff: "+1" }, { cwd: repo }));
+    assertOpRewrite(r, wtPath);
+  });
+
+  it("R05: 绑定态 update_file 副本内绝对路径 → 放行", () => {
+    const r = runHook(ap({ type: "update_file", path: path.join(wtPath, "inside.js"), diff: "+1" }));
+    assertPass(r);
+  });
+
+  it("R06: update_file .git 下 → 拦截（硬规则）", () => {
+    const r = runHook(ap({ type: "update_file", path: path.join(repo, ".git", "config"), diff: "+1" }));
+    assertBlock(r, ".git");
+  });
+
+  it("R07: 无绑定 update_file 其他副本 → 拦截（跨副本保护始终生效）", () => {
+    const r = runHook(ap(
+      { type: "update_file", path: path.join(otherWt, "y.js"), diff: "+1" },
+      { sid: "sess_nobody_r" },
+    ));
+    assertBlock(r, "跨副本");
+  });
+
+  it("R08: 无绑定 update_file 主 checkout → 放行（默认开放）", () => {
+    const r = runHook(ap(
+      { type: "update_file", path: path.join(repo, "free.js"), diff: "+1" },
+      { sid: "sess_nobody_r" },
+    ));
+    assertPass(r);
+  });
+
+  it("R09: 畸形输入（无 operation / path 非字符串）→ 放行（fail-open）", () => {
+    let r = runHook({
+      tool_name: "ApplyPatch", cwd: repo, session_id: sid,
+      tool_input: { callId: "call_r9" },
+    });
+    assertPass(r);
+    r = runHook({
+      tool_name: "ApplyPatch", cwd: repo, session_id: sid,
+      tool_input: { callId: "call_r9", operation: { type: "update_file", path: 42 } },
+    });
+    assertPass(r);
   });
 });
 

@@ -1,6 +1,15 @@
 {
   "name": "zcode-worktree-plugin",
   "plugins": [
-    { "name": "zcode-worktree-guard", "source": "./plugins/zcode-worktree-guard" }
+    {
+      "name": "zcode-worktree-guard",
+      "source": "./plugins/zcode-worktree-guard",
+      "version": "0.4.6",
+      "description": "可选的 git worktree 隔离：默认主副本自由工作；enter 后锁定到副本，路径自动重写 + 跨副本/危险 git 拦截（push 到 master/main 始终需授权）",
+      "displayName": "ZCode Worktree Guard",
+      "displayName_i18n": { "zh-CN": "Worktree 隔离守卫" },
+      "description_i18n": { "zh-CN": "可选的 git worktree 隔离：默认主副本自由工作；enter 后锁定到副本，路径自动重写 + 跨副本/危险 git 拦截（push 到 master/main 始终需授权）" },
+      "category": "developer-tools"
+    }
   ]
 }

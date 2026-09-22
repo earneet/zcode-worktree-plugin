@@ -8,6 +8,9 @@
 //       不注入），hook 是唯一知道真实会话 id 的组件，对其 Bash 命令注入
 //       `export ZCODE_SESSION_ID=<id>; ` 前缀（修复 v0.4.0 绑定永远解析失败的回归）；
 //       ② Read 去武器化——.git/跨副本拒绝仅对写生效，读操作永不拦截、不重写错位。
+// v0.4.6：ApplyPatch 分发覆盖——OpenAI responses 提供方的补丁式写工具经引擎别名
+//       （ApplyPatch→Write/Edit）触发本 hook，但分发层无分支曾静默放行；现与
+//       Write 同表决策（decideWrite），重写只替换 operation.path。
 import * as C from "./common.mjs";
 import path from "node:path";
 import fs from "node:fs";
@@ -170,6 +173,34 @@ function handleFilePathTool(toolInput, context, isWrite) {
 }
 
 // ---------------------------------------------------------------------------
+// ApplyPatch（OpenAI responses 提供方的补丁式写工具，v0.4.6）：
+// 引擎把 apply_patch_call 转成内部 tool-call，stdin 形状（zcode.cjs 源码确证）：
+//   tool_input = { callId, operation: { type: "create_file"|"update_file"|"delete_file",
+//                                       path: string, diff?: string } }
+// hook 触发由引擎的 matcher 别名表达成（ApplyPatch → [Write, Edit]，matchValues
+// 展开后命中 Write/Edit 即触发，stdin 上仍是真实名 "ApplyPatch"）——本插件分发层
+// 此前没有该分支，绑定态下会静默放行：不重写、无跨副本/.git 写保护。三种
+// operation 都是对目标 path 的写（delete_file 也是），故视同 Write 走同一
+// decideWrite 决策表；重写只替换 operation.path，其余字段（callId/diff）原样保留，
+// updatedInput 整体替换后仍过工具 schema 校验。
+function handleApplyPatch(toolInput, context) {
+  const op = toolInput.operation;
+  const target = op && typeof op.path === "string" ? op.path : "";
+  if (!target) return; // 畸形输入 → fail-open 放行
+
+  const targetAbs = path.isAbsolute(target) ? target : path.join(context.cwd, target);
+  context.target = targetAbs;
+
+  const decision = decideWrite(targetAbs, context, true);
+  if (decision.action === "allow") return;
+  if (decision.action === "rewrite") {
+    emitRewrite({ ...toolInput, operation: { ...op, path: decision.newTarget } });
+  }
+  // deny
+  block(decision.reason, context, decision.remedy);
+}
+
+// ---------------------------------------------------------------------------
 function handleSearchPathTool(toolInput, context) {
   const binding = context.binding;
   if (!binding) return; // 无绑定放行（搜索只读）
@@ -303,8 +334,12 @@ async function main() {
     branch = C.currentBranch(effectiveCwd);
     inWt = C.inLinkedWorktree(effectiveCwd);
   } else {
-    const pathField = toolName === "Glob" || toolName === "Grep" ? "path" : "file_path";
-    const targetPath = toolInput[pathField];
+    let targetPath;
+    if (toolName === "Glob" || toolName === "Grep") targetPath = toolInput.path;
+    else if (toolName === "ApplyPatch") {
+      const opPath = toolInput.operation?.path;
+      targetPath = typeof opPath === "string" ? opPath : undefined;
+    } else targetPath = toolInput.file_path;
     ({ common, root } = targetPath ? C.findGitContext(targetPath, cwd) : C.findGitContextForCwd(cwd));
     branch = C.currentBranch(root);
     inWt = C.inLinkedWorktree(root);
@@ -328,6 +363,8 @@ async function main() {
 
   if (toolName === "Write" || toolName === "Edit") {
     handleFilePathTool(toolInput, context, true);
+  } else if (toolName === "ApplyPatch") {
+    handleApplyPatch(toolInput, context);
   } else if (toolName === "Read") {
     handleFilePathTool(toolInput, context, false);
   } else if (toolName === "Glob" || toolName === "Grep") {
