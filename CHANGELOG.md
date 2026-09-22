@@ -2,6 +2,58 @@
 
 本文件记录 zcode-worktree-guard 的版本演进。详细设计见 [docs/design.md](docs/design.md)。
 
+## [0.4.6] — 2026-09-22
+
+### 背景：plugin-creator 标准审查 + 二次复核修正
+
+按 plugin-creator 技能标准对本插件做了一次全面审查，随后对审查结论逐条二次复核。
+**复核推翻了审查的一条主要论断**，如实记录以防误引：审查曾认为 `marketplace.json`
+条目缺 `version` 会导致外部用户装成 0.0.0 且丢失更新提示——隔离环境（`ZCODE_STORAGE_DIR`）
+端到端实测证明**不成立**：引擎安装/更新都以**插件清单**的 `version` 为准
+（add → install → manifest 升版 → marketplace update → plugins update，0.1.0→0.2.0
+正常）。本机 `context7` 装成 0.0.0 的根因是它自己的 `plugin.json` 没有 version 字段。
+
+### 修复：ApplyPatch 分发覆盖——补丁式写工具不再绕过守卫（审查复核后成立）
+
+引擎（zcode.cjs 0.16.9）的工具注册表含 `ApplyPatch`（OpenAI responses 提供方的补丁式
+写工具，`isWriteTool` 与 Write/Edit/Bash 同类）。hook 触发本就有效——引擎对 hook matcher
+做**别名展开**（ApplyPatch→[Write,Edit]，命中即触发，stdin 上仍是真实名）——但
+`guard_hook.mjs` 分发层没有该分支，绑定态下 ApplyPatch 写主 checkout **静默放行**：
+不重写、无跨副本/`.git` 写保护（正是本插件要消灭的路径漂移）。现补齐：与 Write 同一
+`decideWrite` 决策表（create/update/delete 三种 operation 都视为写），重写只替换
+`operation.path`（`callId`/`diff`/`type` 原样保留以过 schema 校验），畸形输入 fail-open
+放行。hooks.json matcher 显式补 `ApplyPatch`（自文档化；引擎别名下行为不变）。
+GLM 等走 Write/Edit 的提供方不产生该工具，无感知。
+
+### 新增：市场条目展示元数据 + LICENSE 随插件分发
+
+- `marketplace.json` 条目补 `version`/`description`/`displayName`/`displayName_i18n`/
+  `description_i18n`/`category`（plugin-creator 规范形态；displayName/i18n/category
+  只能来自条目——引擎不从清单回填这些展示字段）。
+- `plugin.json` 显式声明 `"hooks": "hooks/hooks.json"`（自文档化；引擎自动发现 +
+  显式声明按 realpath 去重，行为不变）。
+- LICENSE 复制进插件目录（市场安装只复制插件目录，此前分发副本不含许可文本）。
+
+### 文档：发布流程更正 + 边界补记
+
+- **AGENTS.md 发布流程重写**：原"zcode CLI 无 install 子命令 → 手动 cp 缓存 + 手改
+  `installed_plugins.json`"前提已过时（引擎 0.16.9 带完整 `plugins install/update/
+  marketplace` CLI，且本仓库根目录早已注册为 directory 市场）。本机生效改为
+  市场刷新 + 插件更新（UI 或 CLI），授权门（不 push/不升版对外提供/不动安装态须
+  用户逐次授权）不变。手动 cp 流程弃用。
+- README/SKILL.md/design.md：拦截规则表补 ApplyPatch 行；已知边界补记"经 MCP 工具
+  写盘（如 node-repl）不在守卫范围"（tool_input 无路径语义，等同 Bash 边界）；
+  design.md §3.2 工具字段表补 ApplyPatch 行及引擎证据（别名展开 + `{callId,
+  operation:{type,path,diff}}` 形状）；README 测试数 157 → 204（陈旧，实际已 195，
+  本版 R 组再 +9）。
+- AGENTS.md 本身入库（此前一直未跟踪，发布纪律文档不在版本库是中间态）。
+
+### 测试
+
+新增 R 组 9 例：ApplyPatch 绑定态重写（update/create/delete/相对路径）、副本内放行、
+`.git` 拦截、无绑定跨副本拦截、无绑定主 checkout 放行、畸形输入 fail-open。
+既有用例零翻转（195 例不变），总计 **204 例全绿**。
+
 ## [0.4.5] — 2026-09-17
 
 ### 背景：issues #3-#7（清理链路的安全与生命周期反馈）

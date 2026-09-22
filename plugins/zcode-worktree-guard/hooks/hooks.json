@@ -15,7 +15,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Write|Edit|Read|Glob|Grep|Bash",
+        "matcher": "Write|Edit|ApplyPatch|Read|Glob|Grep|Bash",
         "hooks": [
           {
             "type": "process",

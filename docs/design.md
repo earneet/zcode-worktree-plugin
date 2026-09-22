@@ -44,9 +44,18 @@ Write 的 file_path 被改写后，文件实际落到改写后路径，原路径
 | Write/Edit/Read | `file_path` | — | 否 |
 | Glob/Grep | `path` (optional) | `pattern` | 否 |
 | Bash | （无路径字段） | `command` | **是** |
+| ApplyPatch（v0.4.6） | `operation.path`（嵌套） | `callId`、`operation.type/diff` | — |
 
 **Bash 无 cwd 字段且 strict**——无法通过 hook 改写其工作目录，这是 ZCode 的硬限制。
 故 Bash 只做拦截，不重写。
+
+**ApplyPatch（v0.4.6 补充，源码确证 zcode.cjs 0.16.9）**：OpenAI responses 提供方的补丁式
+写工具。引擎把 `apply_patch_call` 转成内部 tool-call（`toolName:"ApplyPatch"`，
+`input:{callId, operation:{type:"create_file"|"update_file"|"delete_file", path, diff?}}`）。
+hook 触发靠引擎 **matcher 别名表** `ApplyPatch→[Write,Edit]`（`matchValues` 展开后命中
+Write/Edit 即触发，stdin 上仍是真实名）——因此 matcher 不写 ApplyPatch 也能触发；但分发层
+必须有自己的分支（v0.4.5 及以前缺失 → 绑定态静默放行）。重写只替换 `operation.path`，
+其余字段原样保留以过 schema 校验。GLM 等走 Write/Edit 的提供方不产生该工具。
 
 ### 3.3 stdin 字段
 `session_id`/`sessionId`、`cwd`、`tool_name`/`tool_input`、`hook_event_name`、`permission_mode`。
@@ -95,14 +104,18 @@ PreToolUse stdin 无 parent_session（调用链 `wxn→xcn→xzt`）。session �
 
 ### 4.5 manifest hooks 字段
 **v1 假设**：`"hooks":"hooks/hooks.json"`。
-**证据**：`hooks/hooks.json` 已按约定自动发现。
+**证据**：`hooks/hooks.json` 已按约定自动发现（引擎 `listPluginHookSources` 硬编码探测
+`join(root,"hooks","hooks.json")`；manifest 字段仅用于声明**额外** hook 文件，按 realpath 去重）。
 **修正**：manifest 省略 hooks 字段。
+> **v0.4.6 更新**：重新显式声明 `"hooks":"hooks/hooks.json"`——纯自文档化（plugin-creator
+> 规范形态），引擎行为不变（自动发现 + 显式声明 realpath 去重，不双注册）。
 
 ## 5. 拦截/重写规则表
 
 | 场景 | 行为 |
 |---|---|
 | 有活动 worktree，Write/Edit/Read 主 checkout 路径 | 🔄 重写 R→W |
+| 有活动 worktree，ApplyPatch 主 checkout 路径（v0.4.6） | 🔄 重写 `operation.path` |
 | 有活动 worktree，Glob/Grep 无 path | 🔄 注入 path=W |
 | 有活动 worktree，Glob/Grep path 在主根下 | 🔄 重写 R→W |
 | 有活动 worktree，写副本内路径 | ✅ 放行 |
@@ -135,6 +148,9 @@ PreToolUse stdin 无 parent_session（调用链 `wxn→xcn→xzt`）。session �
   但 Write/Edit 工具会——SKILL 已指导优先用工具写文件。
 - **Bash 正则限制**：只匹配 `git` 直接开头的简单命令，`cd x && git merge` 类组合可能绕过
   （与 kimi 一致的已知限制）。
+- **MCP 工具写盘不在守卫范围**（v0.4.6 记录）：MCP 工具（如 node-repl `js`）的 tool_input
+  无文件路径语义、无法静态重写——等同 Bash 边界，靠 SKILL 纪律（副本相对路径）约束。
+  ApplyPatch 已于 v0.4.6 纳入（见 §3.2）。
 - **无热重载**：hook 注册在 session bootstrap 完成，改 hooks.json 或安装插件后须重启 ZCode。
   但 hook 脚本逻辑改完即生效（每次调用是新进程）。
 
